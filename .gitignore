@@ -1,4 +1,4 @@
-.tmp
+tmp
 .env
 node_modules
 dist
@@ -9,9 +9,3 @@ logs
 .idea
 .vscode
 .DS_Store
-*.swp
-*.swo
-*.bak
-*.tmp
-*.cache
-*.pid
