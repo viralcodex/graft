@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,6 +30,33 @@ type NodeStatus struct {
 }
 
 var client = &http.Client{Timeout: 500 * time.Millisecond}
+
+func parseCluster(cluster string) []string {
+	rawNodes := strings.Split(cluster, ",")
+	nodes := make([]string, 0, len(rawNodes))
+
+	for _, addr := range rawNodes {
+		trimmedAddr := strings.TrimSpace(addr)
+		if trimmedAddr == "" {
+			continue
+		}
+		nodes = append(nodes, trimmedAddr)
+	}
+
+	return nodes
+}
+
+func getFollowers(nodes []NodeStatus) []string {
+	followers := make([]string, 0, len(nodes))
+
+	for _,  node := range nodes {
+		if node.Role == "follower" && node.Err == nil {
+			followers = append(followers, node.Addr)
+		}
+	}
+
+	return followers
+}
 
 func getNodesStatus(nodes []string) []NodeStatus {
 	results := make(chan NodeStatus, len(nodes))
@@ -75,13 +103,14 @@ func pollNode(addr string) NodeStatus {
 
 func main() {
 	port := flag.String("port", "7000", "Gateway port")
+	cluster := flag.String("cluster", "localhost:8000,localhost:8001,localhost:8002", "Comma-separated cluster addresses")
 	flag.Parse()
 
 	gw := &Gateway{
-		nodes: []string{"localhost:8000", "localhost:8001", "localhost:8002"},
+		nodes: parseCluster(*cluster),
 	}
 
-	http.HandleFunc("GET /raft/state", func(w http.ResponseWriter, r *http.Request) { stateHandler(gw, w, r) })
+	http.HandleFunc("GET /raft/state", func(w http.ResponseWriter, r *http.Request) { stateHandler(gw, w) })
 	http.HandleFunc("GET /raft/get/{key}", func(w http.ResponseWriter, r *http.Request) { getHandler(gw, w, r) })
 	http.HandleFunc("PUT /raft/update/{key}", func(w http.ResponseWriter, r *http.Request) { updateHandler(gw, w, r) })
 	http.HandleFunc("DELETE /raft/delete/{key}", func(w http.ResponseWriter, r *http.Request) { deleteHandler(gw, w, r) })
@@ -95,8 +124,7 @@ func main() {
 }
 
 // GET /raft/state — poll all nodes, return cluster state
-func stateHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
-	// TODO: poll each node's /health, find leader, collect followers
+func stateHandler(gw *Gateway, w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 
 	statuses := getNodesStatus(gw.nodes)
@@ -111,7 +139,7 @@ func stateHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(StateResponse{
 		Leader:    gw.leaderAddr,
-		Followers: gw.nodes,
+		Followers: getFollowers(statuses),
 	})
 }
 
