@@ -36,6 +36,20 @@ type clusterProcess struct {
 }
 
 func TestGatewayClientFlow(t *testing.T) {
+	runGatewayClientFlow(t, 3, "test-key", "test-value")
+}
+
+func TestGatewayClientFlowWithSplitVotePressure(t *testing.T) {
+	runGatewayClientFlow(t, 4, "split-vote-key", "split-vote-value")
+}
+
+func TestGatewayClientFlowWithLeaderFailover(t *testing.T) {
+	runGatewayLeaderFailoverFlow(t, 3, "failover-key", "failover-value")
+}
+
+func runGatewayClientFlow(t *testing.T, peerCount int, key string, value string) {
+	t.Helper()
+
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -43,12 +57,13 @@ func TestGatewayClientFlow(t *testing.T) {
 
 	repoRoot := repoRoot(t)
 	binaries := buildBinaries(t, repoRoot)
-	ports := reservePorts(t, 4)
+	stateDir := filepath.Join(t.TempDir(), "raft-state")
+	ports := reservePorts(t, peerCount+1)
 	gatewayPort := ports[0]
 	peerPorts := ports[1:]
 	cluster := clusterAddrs(peerPorts)
 
-	processes := startCluster(t, repoRoot, binaries, gatewayPort, peerPorts, cluster)
+	processes := startCluster(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir)
 	defer stopCluster(t, processes)
 
 	client := &http.Client{Timeout: time.Second}
@@ -67,9 +82,6 @@ func TestGatewayClientFlow(t *testing.T) {
 		t.Fatalf("state leader %q not in cluster %v", state.Leader, cluster)
 	}
 	assertFollowers(t, state, knownNodes, len(cluster)-1)
-
-	key := "test-key"
-	value := "test-value"
 
 	putResp := putValue(t, client, baseURL, key, value)
 	if putResp.Key != key || putResp.Value != value {
@@ -92,6 +104,70 @@ func TestGatewayClientFlow(t *testing.T) {
 
 	logEvent(t, "PASS cluster-state", "%s", mustJSON(t, stateAfterWrite))
 	logEvent(t, "PASS stored-data", "%s", mustJSON(t, getResp))
+}
+
+func runGatewayLeaderFailoverFlow(t *testing.T, peerCount int, key string, value string) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	defer logTestResult(t)
+
+	repoRoot := repoRoot(t)
+	binaries := buildBinaries(t, repoRoot)
+	stateDir := filepath.Join(t.TempDir(), "raft-state")
+	ports := reservePorts(t, peerCount+1)
+	gatewayPort := ports[0]
+	peerPorts := ports[1:]
+	cluster := clusterAddrs(peerPorts)
+
+	processes := startCluster(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir)
+	defer stopCluster(t, processes)
+
+	client := &http.Client{Timeout: time.Second}
+	baseURL := fmt.Sprintf("http://localhost:%d", gatewayPort)
+
+	state := waitForLeader(t, client, baseURL, 10*time.Second)
+	knownNodes := make(map[string]struct{}, len(cluster))
+	for _, addr := range cluster {
+		knownNodes[addr] = struct{}{}
+	}
+	assertFollowers(t, state, knownNodes, len(cluster)-1)
+
+	putResp := putValue(t, client, baseURL, key, value)
+	if putResp.Key != key || putResp.Value != value {
+		t.Fatalf("unexpected PUT response: %+v", putResp)
+	}
+
+	for _, follower := range state.Followers {
+		waitForPeerValue(t, client, follower, key, value, 5*time.Second)
+	}
+
+	leaderProc := peerProcessForAddr(t, processes, cluster, state.Leader)
+	stopProcess(leaderProc)
+
+	remainingNodes := make(map[string]struct{}, len(cluster)-1)
+	for _, addr := range cluster {
+		if addr == state.Leader {
+			continue
+		}
+		remainingNodes[addr] = struct{}{}
+	}
+
+	stateAfterFailover := waitForDifferentLeader(t, client, baseURL, state.Leader, 10*time.Second)
+	if _, ok := remainingNodes[stateAfterFailover.Leader]; !ok {
+		t.Fatalf("new leader %q not in surviving cluster", stateAfterFailover.Leader)
+	}
+	assertFollowers(t, stateAfterFailover, remainingNodes, len(remainingNodes)-1)
+
+	getResp := getValue(t, client, baseURL, key)
+	if getResp.Key != key || getResp.Value != value {
+		t.Fatalf("unexpected GET response after failover: %+v", getResp)
+	}
+
+	logEvent(t, "PASS failover-state", "%s", mustJSON(t, stateAfterFailover))
+	logEvent(t, "PASS failover-data", "%s", mustJSON(t, getResp))
 }
 
 func assertFollowers(t *testing.T, state stateResponse, knownNodes map[string]struct{}, expectedCount int) {
@@ -186,17 +262,19 @@ func clusterAddrs(ports []int) []string {
 	return addrs
 }
 
-func startCluster(t *testing.T, repoRoot string, binaries map[string]string, gatewayPort int, peerPorts []int, cluster []string) []*clusterProcess {
+func startCluster(t *testing.T, repoRoot string, binaries map[string]string, gatewayPort int, peerPorts []int, cluster []string, stateDir string) []*clusterProcess {
 	t.Helper()
 
 	processes := make([]*clusterProcess, 0, len(peerPorts)+1)
 	clusterFlag := strings.Join(cluster, ",")
 
 	for idx, port := range peerPorts {
+		nodeStateDir := filepath.Join(stateDir, fmt.Sprintf("node%d", idx+1))
 		proc := startProcess(t, repoRoot, fmt.Sprintf("peer-%d", idx+1), binaries["peer"],
 			"-port", strconv.Itoa(port),
 			"-nodeId", fmt.Sprintf("node%d", idx+1),
 			"-cluster", clusterFlag,
+			"-stateDir", nodeStateDir,
 		)
 		processes = append(processes, proc)
 	}
@@ -231,11 +309,34 @@ func startProcess(t *testing.T, repoRoot string, name string, binary string, arg
 	return proc
 }
 
+func stopProcess(proc *clusterProcess) {
+	if proc == nil || proc.cmd == nil || proc.cmd.Process == nil {
+		return
+	}
+
+	_ = proc.cmd.Process.Kill()
+	_ = proc.cmd.Wait()
+	proc.cmd = nil
+}
+
+func peerProcessForAddr(t *testing.T, processes []*clusterProcess, cluster []string, addr string) *clusterProcess {
+	t.Helper()
+
+	for idx, peerAddr := range cluster {
+		if peerAddr == addr {
+			return processes[idx]
+		}
+	}
+
+	t.Fatalf("no peer process found for addr %q", addr)
+	return nil
+}
+
 func stopCluster(t *testing.T, processes []*clusterProcess) {
 	t.Helper()
 
 	for _, proc := range processes {
-		if proc.cmd.Process == nil {
+		if proc == nil || proc.cmd == nil || proc.cmd.Process == nil {
 			continue
 		}
 		_ = proc.cmd.Process.Kill()
@@ -307,6 +408,39 @@ func waitForLeader(t *testing.T, client *http.Client, baseURL string, timeout ti
 	return stateResponse{}
 }
 
+func waitForDifferentLeader(t *testing.T, client *http.Client, baseURL string, previousLeader string, timeout time.Duration) stateResponse {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		status, body, err := rawRequest(client, http.MethodGet, baseURL+"/raft/state", nil)
+		if err == nil && status == http.StatusOK {
+			var state stateResponse
+			if err := json.Unmarshal(body, &state); err == nil && state.Leader != "" && state.Leader != previousLeader {
+				logHTTPResponse(t, "PASS GET /raft/state", status, body)
+				return state
+			}
+			lastErr = fmt.Errorf("gateway state did not include a new leader yet")
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if err == nil {
+			lastErr = fmt.Errorf("unexpected state status %d: %s", status, string(body))
+		} else {
+			lastErr = err
+		}
+		if err == nil {
+			logHTTPResponse(t, "FAIL GET /raft/state", status, body)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("leader failover did not stabilize within %s: %v", timeout, lastErr)
+	return stateResponse{}
+}
+
 func getState(t *testing.T, client *http.Client, baseURL string) stateResponse {
 	t.Helper()
 
@@ -327,6 +461,28 @@ func getState(t *testing.T, client *http.Client, baseURL string) stateResponse {
 
 	return state
 }
+
+func waitForPeerValue(t *testing.T, client *http.Client, addr string, key string, value string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	peerURL := fmt.Sprintf("http://%s/kv/%s", addr, key)
+
+	for time.Now().Before(deadline) {
+		status, body, err := rawRequest(client, http.MethodGet, peerURL, nil)
+		if err == nil && status == http.StatusOK {
+			var response kvResponse
+			if err := json.Unmarshal(body, &response); err == nil && response.Key == key && response.Value == value {
+				logHTTPResponse(t, "PASS GET /kv/"+key, status, body)
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("peer %q did not apply key %q within %s", addr, key, timeout)
+}
+
 func putValue(t *testing.T, client *http.Client, baseURL string, key string, value string) kvResponse {
 	t.Helper()
 

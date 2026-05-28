@@ -6,13 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 )
-
-type KVStore struct {
-	mu   sync.RWMutex
-	data map[string]string //current in-memory data
-}
 
 type PutRequest struct {
 	Value string `json:"value"`
@@ -39,8 +33,10 @@ type RootResponse struct {
 }
 
 type VoteRequest struct {
-	Term        int    `json:"term"`
-	CandidateId string `json:"candidateId"`
+	Term         int    `json:"term"`
+	CandidateId  string `json:"candidateId"`
+	LastLogIndex int    `json:"lastLogIndex"`
+	LastLogTerm  int    `json:"lastLogTerm"`
 }
 
 type VoteResponse struct {
@@ -48,26 +44,32 @@ type VoteResponse struct {
 	VoteGranted bool `json:"voteGranted"`
 }
 
-type HeartbeatRequest struct {
-	Term     int    `json:"term"`
-	LeaderId string `json:"leaderId"`
+type AppendEntriesRequest struct {
+	Term              int        `json:"term"`
+	LeaderId          string     `json:"leaderId"`
+	PrevLogIndex      int        `json:"prevLogIndex"`
+	PrevLogTerm       int        `json:"prevLogTerm"`
+	Entries           []LogEntry `json:"entries"`
+	LeaderCommitIndex int        `json:"leaderCommitIndex"`
 }
 
-type HeartbeatResponse struct {
+type AppendEntriesResponse struct {
 	Term    int  `json:"term"`
 	Success bool `json:"success"`
 }
 
-func initialise() *KVStore {
-	return &KVStore{
-		data: make(map[string]string),
-	}
+type Command struct {
+	ReqId     string 
+	Operation string 
+	Key       string 
+	Value     string
 }
 
-func setupConfig() (string, string, string, []string) {
+func setupConfig() (string, string, string, []string, string) {
 	port := flag.String("port", "8000", "HTTP server port")
 	nodeId := flag.String("nodeId", "node1", "nodeId for the server")
 	cluster := flag.String("cluster", "localhost:8000,localhost:8001,localhost:8002", "Comma-separated cluster addresses")
+	stateDir := flag.String("stateDir", "state", "Directory for persisted raft state")
 	role := "follower"
 	flag.Parse()
 
@@ -83,7 +85,7 @@ func setupConfig() (string, string, string, []string) {
 		peers = append(peers, trimmedAddr)
 	}
 
-	return *port, *nodeId, role, peers
+	return *port, *nodeId, role, peers, *stateDir
 }
 
 func startServer(port string) error {
@@ -93,19 +95,18 @@ func startServer(port string) error {
 }
 
 func main() {
-	store := initialise()
-	port, nodeId, role, peers := setupConfig()
-	initRaftState(nodeId, role, peers)
+	port, nodeId, role, peers, stateDir := setupConfig()
+	initRaftState(nodeId, role, peers, stateDir)
 
 	go runElectionTimer() //start the timer
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { rootHandler(w, r) })
 	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { statusHandler(w, r, port, nodeId) })
-	http.HandleFunc("GET /kv/{key}", func(w http.ResponseWriter, r *http.Request) { getValueHandler(store, w, r) })
-	http.HandleFunc("PUT /kv/{key}", func(w http.ResponseWriter, r *http.Request) { putValueHandler(store, w, r) })
-	http.HandleFunc("DELETE /kv/{key}", func(w http.ResponseWriter, r *http.Request) { deleteValueHandler(store, w, r) })
-	http.HandleFunc("POST /vote", func(w http.ResponseWriter, r *http.Request) { requestVoteHandler(store, w, r) })
-	http.HandleFunc("POST /heartbeat", func(w http.ResponseWriter, r *http.Request) { heartbeatHandler(w, r) })
+	http.HandleFunc("GET /kv/{key}", func(w http.ResponseWriter, r *http.Request) { getValueHandler(w, r) })
+	http.HandleFunc("PUT /kv/{key}", func(w http.ResponseWriter, r *http.Request) { putValueHandler(w, r) })
+	http.HandleFunc("DELETE /kv/{key}", func(w http.ResponseWriter, r *http.Request) { deleteValueHandler(w, r) })
+	http.HandleFunc("POST /vote", func(w http.ResponseWriter, r *http.Request) { requestVoteHandler(w, r) })
+	http.HandleFunc("POST /appendEntries", func(w http.ResponseWriter, r *http.Request) { appendEntriesHandler(w, r) })
 
 	if err := startServer(port); err != nil {
 		fmt.Println("Error starting server:", err)
@@ -146,12 +147,12 @@ func statusHandler(w http.ResponseWriter, _ *http.Request, port string, nodeId s
 }
 
 // gets a value from the concurrent map or returns null
-func getValueHandler(store *KVStore, w http.ResponseWriter, r *http.Request) {
+func getValueHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
-	store.mu.RLock()
-	value, ok := store.data[key]
-	store.mu.RUnlock()
+	Store.mu.RLock()
+	value, ok := Store.data[key]
+	Store.mu.RUnlock()
 
 	if !ok {
 		http.Error(w, "No record for this key", http.StatusNotFound)
@@ -171,8 +172,9 @@ func getValueHandler(store *KVStore, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func putValueHandler(store *KVStore, w http.ResponseWriter, r *http.Request) {
+func putValueHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	reqId := r.Header.Get("X-Request-ID")
 
 	var req PutRequest
 
@@ -182,9 +184,19 @@ func putValueHandler(store *KVStore, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	store.mu.Lock()
-	store.data[key] = req.Value
-	store.mu.Unlock()
+	command := Command{
+		ReqId:     reqId,
+		Operation: "PUT",
+		Key:       key,
+		Value:     req.Value,
+	}
+
+	res := submitCommand(command)
+
+	if !res {
+		http.Error(w, "failed to commit write", http.StatusBadGateway)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -199,12 +211,22 @@ func putValueHandler(store *KVStore, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func deleteValueHandler(store *KVStore, w http.ResponseWriter, r *http.Request) {
+func deleteValueHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	reqId := r.Header.Get("X-Request-ID")
 
-	store.mu.Lock()
-	delete(store.data, key)
-	store.mu.Unlock()
+	command := Command{
+		ReqId:     reqId,
+		Operation: "DELETE",
+		Key:       key,
+	}
+
+	res := submitCommand(command)
+
+	if !res {
+		http.Error(w, "failed to commit delete", http.StatusBadGateway)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -219,7 +241,7 @@ func deleteValueHandler(store *KVStore, w http.ResponseWriter, r *http.Request) 
 	}
 }
 
-func requestVoteHandler(_ *KVStore, w http.ResponseWriter, r *http.Request) {
+func requestVoteHandler(w http.ResponseWriter, r *http.Request) {
 	var req VoteRequest
 
 	err := json.NewDecoder(r.Body).Decode(&req)
@@ -239,8 +261,8 @@ func requestVoteHandler(_ *KVStore, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
-	var req HeartbeatRequest
+func appendEntriesHandler(w http.ResponseWriter, r *http.Request) {
+	var req AppendEntriesRequest
 
 	err := json.NewDecoder(r.Body).Decode(&req)
 
@@ -249,7 +271,7 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res := receiveHeartBeat(req)
+	res := receiveAppendEntries(req)
 
 	w.Header().Set("Content-Type", "application/json")
 

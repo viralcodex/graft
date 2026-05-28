@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"github.com/oklog/ulid/v2"
 )
 
 type Gateway struct {
@@ -123,6 +124,15 @@ func main() {
 	}
 }
 
+func getReqId(r *http.Request) string {
+	reqId := r.Header.Get("X-Request-ID")
+	if reqId != "" {
+		return reqId
+	}
+	reqId = ulid.Make().String()
+	return reqId
+}
+
 // GET /raft/state — poll all nodes, return cluster state
 func stateHandler(gw *Gateway, w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
@@ -204,6 +214,9 @@ func reqNode(method string, url string, w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "bad request", http.StatusInternalServerError)
 		return
 	}
+	
+	reqId := getReqId(r)
+	req.Header.Set("X-Request-ID", reqId)
 
 	resp, err := client.Do(req)
 
@@ -215,6 +228,7 @@ func reqNode(method string, url string, w http.ResponseWriter, r *http.Request) 
 	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", reqId)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
