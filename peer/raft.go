@@ -53,24 +53,6 @@ type LeaderIndexState struct {
 var raftState RaftState
 var client = &http.Client{Timeout: 120 * time.Millisecond}
 
-func randomTimeout() time.Duration {
-	return time.Duration(150+rand.Intn(150)) * time.Millisecond
-}
-
-func resetElectionTimer() {
-	raftState.timer.Reset(randomTimeout())
-}
-
-func stepDownLocked(newTerm int) {
-	raftState.role = "follower"
-	if newTerm > raftState.persistentState.CurrentTerm {
-		raftState.persistentState.CurrentTerm = newTerm
-		raftState.persistentState.VotedFor = ""
-		persistLocked()
-	}
-	resetElectionTimer()
-}
-
 func initRaftState(nodeId string, role string, peers []string, stateDir string) {
 	persistantState := loadPersistantState(nodeId, stateDir)
 
@@ -95,6 +77,68 @@ func initRaftState(nodeId string, role string, peers []string, stateDir string) 
 		leaderIndexState: leaderIndexState,
 	}
 }
+
+func randomTimeout() time.Duration {
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond
+}
+
+func resetElectionTimer() {
+	raftState.timer.Reset(randomTimeout())
+}
+
+func stepDownLocked(newTerm int) {
+	raftState.role = "follower"
+	if newTerm > raftState.persistentState.CurrentTerm {
+		raftState.persistentState.CurrentTerm = newTerm
+		raftState.persistentState.VotedFor = ""
+		persistLocked()
+	}
+	resetElectionTimer()
+}
+
+func persistLocked() {
+	if err := savePersistentState(raftState.persistentState, raftState.nodeId, raftState.stateDir); err != nil {
+		panic(err)
+	}
+}
+
+/*
+commit the entries from commitIndex -> lastIndex (uncommitted entries) if majority nodes have replicated the entries sent from leader
+then apply those entries to the state machine (applyToStore)
+*/
+func advanceCommitIndexLocked() {
+	lastIndex := len(raftState.persistentState.Log)
+
+	for i := lastIndex; i > raftState.indexState.CommitIndex; i-- {
+		if raftState.persistentState.Log[i-1].Term != raftState.persistentState.CurrentTerm {
+			continue
+		}
+
+		replicationNumber := 1 //replicated myself (leader)
+
+		for _, peer := range raftState.peers {
+			if raftState.leaderIndexState.MatchIndex[peer] >= i {
+				replicationNumber++
+			}
+		}
+
+		//when majority, commit these entries to your log & apply to state machine
+		if replicationNumber > (len(raftState.peers)+1)/2 {
+			raftState.indexState.CommitIndex = i
+			applyCommittedEntriesLocked()
+			return
+		}
+	}
+}
+
+func applyCommittedEntriesLocked() {
+	for raftState.indexState.LastApplied < raftState.indexState.CommitIndex {
+		raftState.indexState.LastApplied++
+		currCommand := raftState.persistentState.Log[raftState.indexState.LastApplied-1].Command
+		applyToStore(currCommand)
+	}
+}
+
 
 func loadPersistantState(nodeId string, stateDir string) PersistentState {
 	path := filepath.Join(stateDir, nodeId+".json")
@@ -132,51 +176,28 @@ func loadPersistantState(nodeId string, stateDir string) PersistentState {
 	return persistentState
 }
 
+/**
+saves the log file as a json
+*/
 func savePersistentState(state PersistentState, nodeId string, stateDir string) error {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return err
 	}
-
+	
 	path := filepath.Join(stateDir, nodeId+".json")
-
+	
 	bytes, err := json.MarshalIndent(state, "", "	")
-
+	
 	if err != nil {
 		return err
 	}
-
+	
 	return os.WriteFile(path, bytes, 0o644)
 }
 
-func runElectionTimer() {
-	for {
-		<-raftState.timer.C //blocks until timer fires
-
-		raftState.mu.Lock()
-		if raftState.role == "leader" {
-			raftState.mu.Unlock()
-			continue
-		}
-		raftState.mu.Unlock()
-
-		startElection()
-	}
-}
-
-func persistLocked() {
-	if err := savePersistentState(raftState.persistentState, raftState.nodeId, raftState.stateDir); err != nil {
-		panic(err)
-	}
-}
-
-func applyCommittedEntriesLocked() {
-	for raftState.indexState.LastApplied < raftState.indexState.CommitIndex {
-		raftState.indexState.LastApplied++
-		currCommand := raftState.persistentState.Log[raftState.indexState.LastApplied-1].Command
-		applyToStore(currCommand)
-	}
-}
-
+/*
+apply the request to the state machine (persistent storage)
+*/
 func applyToStore(command Command) AppliedResult {
 	result := AppliedResult{
 		Found: false,
@@ -210,6 +231,15 @@ func applyToStore(command Command) AppliedResult {
 	return result
 }
 
+/*
+commits the command entry to the Log (making sure the idempotency is maintained)
+
+if the reqID is already applied, return true early (already applied)
+
+if not, we try to see if the entry is already present in the log.
+
+if not, we append it to the log and then keep waiting for 2 seconds until the entry is applied to state machine & return if done or not
+*/
 func submitCommand(command Command) bool {
 	raftState.mu.Lock()
 
@@ -252,7 +282,7 @@ func submitCommand(command Command) bool {
 
 	timeout := time.Now().Add(2 * time.Second)
 
-	//keeps checking for 2 seconds until timeout
+	//keeps checking for 2 seconds until timeout that the entry is committed or the leadership is lost
 	for time.Now().Before(timeout) {
 		raftState.mu.Lock()
 		isSaved := raftState.indexState.LastApplied >= existingIndex
@@ -271,11 +301,38 @@ func submitCommand(command Command) bool {
 	return false
 }
 
+/**
+main loop keeps running, if the timer expires & the node isn't the leader, start election
+*/
+func runElectionTimer() {
+	for {
+		<-raftState.timer.C //blocks until timer fires
+
+		raftState.mu.Lock()
+		if raftState.role == "leader" {
+			raftState.mu.Unlock()
+			continue
+		}
+		raftState.mu.Unlock()
+
+		startElection()
+	}
+}
+
+/*
+this function makes the node a candidate, and sends a vote request to every follower.
+
+1. if it receives a term higher that its own, it steps down immediately
+
+2. if you receive votes > (peers + 1)/2, become leader
+
+3. if you receive less votes than majority or impossible to achieve, step down early
+*/
 func startElection() {
 	raftState.mu.Lock()
 	raftState.persistentState.CurrentTerm++
+	raftState.persistentState.VotedFor = raftState.nodeId //vote for yourself
 	raftState.role = "candidate"
-	raftState.persistentState.VotedFor = raftState.nodeId
 	resetElectionTimer()
 
 	persistLocked()
@@ -284,6 +341,7 @@ func startElection() {
 	nodeId := raftState.nodeId
 	peers := raftState.peers
 
+	// current log state for this node (send it to others to compare with)
 	lastLogIndex := len(raftState.persistentState.Log)
 	lastLogTerm := 0
 
@@ -372,10 +430,12 @@ func startElection() {
 }
 
 /*
-*
-* a follower grants vote to a candidate if:
+A follower grants vote to a candidate if:
+
 1. its term is less than candidate term
+
 2. its hasn't voted for anyone else in the term it's in (raftState.currentTerm)
+
 3. if the log state of the candidate is ahead than the follower (logterm and then logindex(tiebreaker))
 */
 func grantVote(req VoteRequest) VoteResponse {
@@ -426,6 +486,13 @@ func grantVote(req VoteRequest) VoteResponse {
 	}
 }
 
+/*
+sends heartbeats (empty entries[]) at constant intervals of 50 ms to all followers
+
+sends entries (logs) to append to each follower's append logs (on client requests)
+
+if the follower rejects the req with false, it retries indefinitely until the follower accepts.
+*/
 func sendAppendEntries() {
 	for {
 		raftState.mu.Lock()
@@ -486,7 +553,7 @@ func sendAppendEntries() {
 					return
 				}
 
-				//on success from the follower, we increase the next and match index ahead by how many entries are replicated for this node
+				//on success from the follower, we increase the next and match index ahead by how many entries are replicated for this node & advance the commit index
 				if resp.Success {
 					replicatedIndex := req.PrevLogIndex + len(req.Entries)
 					raftState.leaderIndexState.MatchIndex[addr] = replicatedIndex
@@ -503,30 +570,6 @@ func sendAppendEntries() {
 			}(peer, appendReq)
 		}
 		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-func advanceCommitIndexLocked() {
-	lastIndex := len(raftState.persistentState.Log)
-
-	for i := lastIndex; i > raftState.indexState.CommitIndex; i-- {
-		if raftState.persistentState.Log[i-1].Term != raftState.persistentState.CurrentTerm {
-			continue
-		}
-
-		replicationNumber := 1 //replicated myself (leader)
-
-		for _, peer := range raftState.peers {
-			if raftState.leaderIndexState.MatchIndex[peer] >= i {
-				replicationNumber++
-			}
-		}
-
-		if replicationNumber > (len(raftState.peers)+1)/2 {
-			raftState.indexState.CommitIndex = i
-			applyCommittedEntriesLocked()
-			return
-		}
 	}
 }
 
@@ -552,6 +595,18 @@ func sendAppendEntry(peer string, req AppendEntriesRequest) (AppendEntriesRespon
 	return response, nil
 }
 
+/*
+the follower node receive the request (hearbeat/appendEntry)
+
+it rejects the request if:
+
+1. the term of the last log entry of the leader doesn't match that of the follower
+2. the index of the last log entry of the leader is OOB
+
+otherwise the follower removes all its logs ahead of the last log index (from the leader) [:lastIndex]
+
+then it appends the entries (From the req) from that point to the follower's logs [lastIndex:]
+*/
 func receiveAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 	raftState.mu.Lock()
 	defer raftState.mu.Unlock()
@@ -586,7 +641,7 @@ func receiveAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 
 	i := 0
 	for i < len(req.Entries) {
-		localPos := insertAt + i // 0-based index into log
+		localPos := insertAt + i // offset from the lastIndex in node's log
 		if localPos >= len(log) {
 			break
 		}
