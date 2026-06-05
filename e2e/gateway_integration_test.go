@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -26,6 +27,28 @@ type stateResponse struct {
 type kvResponse struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+type persistedState struct {
+	CurrentTerm int              `json:"currentTerm"`
+	VotedFor    string           `json:"votedFor"`
+	Log         []persistedEntry `json:"log"`
+}
+
+type persistedEntry struct {
+	Term  int `json:"term"`
+	Index int `json:"index"`
+}
+
+type persistedSnapshot struct {
+	LastIncludedIndex int               `json:"lastIncludedIndex"`
+	LastIncludedTerm  int               `json:"lastIncludedTerm"`
+	Data              map[string]string `json:"data"`
+	AppliedReqIDs     map[string]any    `json:"appliedReqIds"`
+}
+
+type clusterOptions struct {
+	peerEnv map[string]string
 }
 
 type clusterProcess struct {
@@ -45,6 +68,147 @@ func TestGatewayClientFlowWithSplitVotePressure(t *testing.T) {
 
 func TestGatewayClientFlowWithLeaderFailover(t *testing.T) {
 	runGatewayLeaderFailoverFlow(t, 3, "failover-key", "failover-value")
+}
+
+func TestLeaderCreatesSnapshotAndCompactsLog(t *testing.T) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	defer logTestResult(t)
+
+	repoRoot := repoRoot(t)
+	binaries := buildBinaries(t, repoRoot)
+	stateDir := filepath.Join(t.TempDir(), "raft-state")
+	ports := reservePorts(t, 4)
+	gatewayPort := ports[0]
+	peerPorts := ports[1:]
+	cluster := clusterAddrs(peerPorts)
+	processes := startClusterWithOptions(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir, clusterOptions{
+		peerEnv: map[string]string{
+			"DEV_LOG_SIZE":          strconv.FormatInt(1<<30, 10),
+			"UNAPPLIED_LOG_ENTRIES": "1",
+		},
+	})
+	defer stopCluster(t, processes)
+
+	client := &http.Client{Timeout: time.Second}
+	baseURL := fmt.Sprintf("http://localhost:%d", gatewayPort)
+
+	state := waitForLeader(t, client, baseURL, 10*time.Second)
+
+	for idx := 0; idx < 3; idx++ {
+		key := fmt.Sprintf("snapshot-key-%d", idx)
+		value := fmt.Sprintf("snapshot-value-%d", idx)
+		putResp := putValue(t, client, baseURL, key, value)
+		if putResp.Key != key || putResp.Value != value {
+			t.Fatalf("unexpected PUT response: %+v", putResp)
+		}
+		for _, addr := range cluster {
+			waitForPeerValue(t, client, addr, key, value, 5*time.Second)
+		}
+	}
+
+	leaderNodeID := nodeIDForAddr(t, cluster, state.Leader)
+	leaderStateDir := filepath.Join(stateDir, leaderNodeID)
+
+	waitForSnapshotState(t, leaderStateDir, leaderNodeID, func(snapshot persistedSnapshot, persisted persistedState) bool {
+		return snapshot.LastIncludedIndex >= 2 && len(persisted.Log) <= 1
+	}, 10*time.Second)
+
+	snapshot := readSnapshotFile(t, leaderStateDir, leaderNodeID)
+	persisted := readPersistentStateFile(t, leaderStateDir, leaderNodeID)
+
+	if snapshot.LastIncludedIndex < 2 {
+		t.Fatalf("expected leader snapshot to include at least 2 entries, got %d", snapshot.LastIncludedIndex)
+	}
+	if got := snapshot.Data["snapshot-key-1"]; got != "snapshot-value-1" {
+		t.Fatalf("expected snapshot to include compacted value, got %q", got)
+	}
+	if len(persisted.Log) > 1 {
+		t.Fatalf("expected leader log to be compacted, got %d entries", len(persisted.Log))
+	}
+	if len(persisted.Log) == 1 && persisted.Log[0].Index <= snapshot.LastIncludedIndex {
+		t.Fatalf("expected remaining log entry to be after snapshot index %d, got %+v", snapshot.LastIncludedIndex, persisted.Log[0])
+	}
+
+	logEvent(t, "PASS snapshot-created", "leader=%s snapshotIndex=%d remainingLog=%d", state.Leader, snapshot.LastIncludedIndex, len(persisted.Log))
+}
+
+func TestFollowerCatchesUpFromSnapshotAfterRestart(t *testing.T) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	defer logTestResult(t)
+
+	repoRoot := repoRoot(t)
+	binaries := buildBinaries(t, repoRoot)
+	stateDir := filepath.Join(t.TempDir(), "raft-state")
+	ports := reservePorts(t, 4)
+	gatewayPort := ports[0]
+	peerPorts := ports[1:]
+	cluster := clusterAddrs(peerPorts)
+	peerEnv := map[string]string{
+		"DEV_LOG_SIZE":          strconv.FormatInt(1<<30, 10),
+		"UNAPPLIED_LOG_ENTRIES": "1",
+	}
+	processes := startClusterWithOptions(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir, clusterOptions{peerEnv: peerEnv})
+	defer stopCluster(t, processes)
+
+	client := &http.Client{Timeout: time.Second}
+	baseURL := fmt.Sprintf("http://localhost:%d", gatewayPort)
+
+	state := waitForLeader(t, client, baseURL, 10*time.Second)
+	if len(state.Followers) == 0 {
+		t.Fatal("expected at least one follower")
+	}
+
+	laggingFollowerAddr := state.Followers[0]
+	laggingFollowerNodeID := nodeIDForAddr(t, cluster, laggingFollowerAddr)
+	laggingFollowerProc := peerProcessForAddr(t, processes, cluster, laggingFollowerAddr)
+	stopProcess(laggingFollowerProc)
+
+	keys := []string{"offline-key-0", "offline-key-1", "offline-key-2"}
+	for idx, key := range keys {
+		value := fmt.Sprintf("offline-value-%d", idx)
+		putResp := putValue(t, client, baseURL, key, value)
+		if putResp.Key != key || putResp.Value != value {
+			t.Fatalf("unexpected PUT response: %+v", putResp)
+		}
+	}
+
+	leaderState := getState(t, client, baseURL)
+	leaderNodeID := nodeIDForAddr(t, cluster, leaderState.Leader)
+	leaderStateDir := filepath.Join(stateDir, leaderNodeID)
+	waitForSnapshotState(t, leaderStateDir, leaderNodeID, func(snapshot persistedSnapshot, persisted persistedState) bool {
+		return snapshot.LastIncludedIndex >= 2 && len(persisted.Log) <= 1
+	}, 10*time.Second)
+
+	restartedFollower := startProcess(t, repoRoot, laggingFollowerNodeID, binaries["peer"], peerEnv,
+		"-port", strconv.Itoa(portForAddr(t, laggingFollowerAddr)),
+		"-nodeId", laggingFollowerNodeID,
+		"-cluster", strings.Join(cluster, ","),
+		"-stateDir", filepath.Join(stateDir, laggingFollowerNodeID),
+	)
+	replaceProcessForAddr(t, processes, cluster, laggingFollowerAddr, restartedFollower)
+	waitForEndpoint(t, fmt.Sprintf("http://%s/health", laggingFollowerAddr), 5*time.Second)
+
+	for idx, key := range keys {
+		waitForPeerValue(t, client, laggingFollowerAddr, key, fmt.Sprintf("offline-value-%d", idx), 10*time.Second)
+	}
+
+	laggingSnapshot := readSnapshotFile(t, filepath.Join(stateDir, laggingFollowerNodeID), laggingFollowerNodeID)
+	if laggingSnapshot.LastIncludedIndex < 2 {
+		t.Fatalf("expected restarted follower snapshot to be installed, got index %d", laggingSnapshot.LastIncludedIndex)
+	}
+	if got := laggingSnapshot.Data[keys[1]]; got != "offline-value-1" {
+		t.Fatalf("expected follower snapshot to contain compacted value, got %q", got)
+	}
+
+	logEvent(t, "PASS snapshot-restart", "follower=%s snapshotIndex=%d", laggingFollowerAddr, laggingSnapshot.LastIncludedIndex)
 }
 
 func runGatewayClientFlow(t *testing.T, peerCount int, key string, value string) {
@@ -264,13 +428,18 @@ func clusterAddrs(ports []int) []string {
 
 func startCluster(t *testing.T, repoRoot string, binaries map[string]string, gatewayPort int, peerPorts []int, cluster []string, stateDir string) []*clusterProcess {
 	t.Helper()
+	return startClusterWithOptions(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir, clusterOptions{})
+}
+
+func startClusterWithOptions(t *testing.T, repoRoot string, binaries map[string]string, gatewayPort int, peerPorts []int, cluster []string, stateDir string, options clusterOptions) []*clusterProcess {
+	t.Helper()
 
 	processes := make([]*clusterProcess, 0, len(peerPorts)+1)
 	clusterFlag := strings.Join(cluster, ",")
 
 	for idx, port := range peerPorts {
 		nodeStateDir := filepath.Join(stateDir, fmt.Sprintf("node%d", idx+1))
-		proc := startProcess(t, repoRoot, fmt.Sprintf("peer-%d", idx+1), binaries["peer"],
+		proc := startProcess(t, repoRoot, fmt.Sprintf("peer-%d", idx+1), binaries["peer"], options.peerEnv,
 			"-port", strconv.Itoa(port),
 			"-nodeId", fmt.Sprintf("node%d", idx+1),
 			"-cluster", clusterFlag,
@@ -279,7 +448,7 @@ func startCluster(t *testing.T, repoRoot string, binaries map[string]string, gat
 		processes = append(processes, proc)
 	}
 
-	processes = append(processes, startProcess(t, repoRoot, "gateway", binaries["gateway"],
+	processes = append(processes, startProcess(t, repoRoot, "gateway", binaries["gateway"], nil,
 		"-port", strconv.Itoa(gatewayPort),
 		"-cluster", clusterFlag,
 	))
@@ -292,11 +461,12 @@ func startCluster(t *testing.T, repoRoot string, binaries map[string]string, gat
 	return processes
 }
 
-func startProcess(t *testing.T, repoRoot string, name string, binary string, args ...string) *clusterProcess {
+func startProcess(t *testing.T, repoRoot string, name string, binary string, env map[string]string, args ...string) *clusterProcess {
 	t.Helper()
 
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(), formatEnv(env)...)
 
 	proc := &clusterProcess{name: name, cmd: cmd}
 	cmd.Stdout = &proc.stdout
@@ -307,6 +477,25 @@ func startProcess(t *testing.T, repoRoot string, name string, binary string, arg
 	}
 
 	return proc
+}
+
+func formatEnv(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	formatted := make([]string, 0, len(env))
+	for _, key := range keys {
+		formatted = append(formatted, key+"="+env[key])
+	}
+
+	return formatted
 }
 
 func stopProcess(proc *clusterProcess) {
@@ -330,6 +519,48 @@ func peerProcessForAddr(t *testing.T, processes []*clusterProcess, cluster []str
 
 	t.Fatalf("no peer process found for addr %q", addr)
 	return nil
+}
+
+func replaceProcessForAddr(t *testing.T, processes []*clusterProcess, cluster []string, addr string, proc *clusterProcess) {
+	t.Helper()
+
+	for idx, peerAddr := range cluster {
+		if peerAddr == addr {
+			processes[idx] = proc
+			return
+		}
+	}
+
+	t.Fatalf("no peer process slot found for addr %q", addr)
+}
+
+func nodeIDForAddr(t *testing.T, cluster []string, addr string) string {
+	t.Helper()
+
+	for idx, peerAddr := range cluster {
+		if peerAddr == addr {
+			return fmt.Sprintf("node%d", idx+1)
+		}
+	}
+
+	t.Fatalf("no node id found for addr %q", addr)
+	return ""
+}
+
+func portForAddr(t *testing.T, addr string) int {
+	t.Helper()
+
+	_, portText, ok := strings.Cut(addr, ":")
+	if !ok {
+		t.Fatalf("addr %q missing port", addr)
+	}
+
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse port for %q: %v", addr, err)
+	}
+
+	return port
 }
 
 func stopCluster(t *testing.T, processes []*clusterProcess) {
@@ -528,6 +759,66 @@ func getValue(t *testing.T, client *http.Client, baseURL string, key string) kvR
 	}
 
 	return response
+}
+
+func readPersistentStateFile(t *testing.T, stateDir string, nodeID string) persistedState {
+	t.Helper()
+
+	path := filepath.Join(stateDir, nodeID+".json")
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read persistent state %s: %v", path, err)
+	}
+
+	var state persistedState
+	if err := json.Unmarshal(bytes, &state); err != nil {
+		t.Fatalf("decode persistent state %s: %v", path, err)
+	}
+
+	return state
+}
+
+func readSnapshotFile(t *testing.T, stateDir string, nodeID string) persistedSnapshot {
+	t.Helper()
+
+	path := filepath.Join(stateDir, nodeID+".snapshot.json")
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot file %s: %v", path, err)
+	}
+
+	var snapshot persistedSnapshot
+	if err := json.Unmarshal(bytes, &snapshot); err != nil {
+		t.Fatalf("decode snapshot file %s: %v", path, err)
+	}
+
+	if snapshot.Data == nil {
+		snapshot.Data = make(map[string]string)
+	}
+
+	return snapshot
+}
+
+func waitForSnapshotState(t *testing.T, stateDir string, nodeID string, ready func(persistedSnapshot, persistedState) bool, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var lastSnapshot persistedSnapshot
+	var lastState persistedState
+
+	for time.Now().Before(deadline) {
+		snapshotPath := filepath.Join(stateDir, nodeID+".snapshot.json")
+		if _, err := os.Stat(snapshotPath); err == nil {
+			lastSnapshot = readSnapshotFile(t, stateDir, nodeID)
+			lastState = readPersistentStateFile(t, stateDir, nodeID)
+			if ready(lastSnapshot, lastState) {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("snapshot state for %s did not satisfy condition within %s: snapshot=%+v remainingLog=%d", nodeID, timeout, lastSnapshot, len(lastState.Log))
 }
 
 func rawRequest(client *http.Client, method string, url string, body []byte) (int, []byte, error) {

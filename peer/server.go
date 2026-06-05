@@ -107,7 +107,7 @@ func main() {
 	http.HandleFunc("DELETE /kv/{key}", func(w http.ResponseWriter, r *http.Request) { deleteValueHandler(w, r) })
 	http.HandleFunc("POST /vote", func(w http.ResponseWriter, r *http.Request) { requestVoteHandler(w, r) })
 	http.HandleFunc("POST /appendEntries", func(w http.ResponseWriter, r *http.Request) { appendEntriesHandler(w, r) })
-
+	http.HandleFunc("POST /snapshot", func(w http.ResponseWriter, r *http.Request) {receiveSnapshotHandler(w, r)})
 	if err := startServer(port); err != nil {
 		fmt.Println("Error starting server:", err)
 	}
@@ -123,7 +123,6 @@ func rootHandler(w http.ResponseWriter, _ *http.Request) {
 
 	if err != nil {
 		http.Error(w, "Node not responding", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -142,7 +141,6 @@ func statusHandler(w http.ResponseWriter, _ *http.Request, port string, nodeId s
 
 	if err != nil {
 		http.Error(w, "Node not responding", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -168,7 +166,6 @@ func getValueHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		http.Error(w, "failed to get value", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -207,7 +204,6 @@ func putValueHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		http.Error(w, "Failed to update store", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -237,7 +233,6 @@ func deleteValueHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		http.Error(w, "Failed to delete record", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -257,7 +252,6 @@ func requestVoteHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := json.NewEncoder(w).Encode(vote); err != nil {
 		http.Error(w, "Failed to vote", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -277,6 +271,29 @@ func appendEntriesHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := json.NewEncoder(w).Encode(res); err != nil {
 		http.Error(w, "Failed to vote", http.StatusInternalServerError)
+	}
+}
+
+func receiveSnapshotHandler(w http.ResponseWriter, r *http.Request) {
+	var req InstallSnapshotRequest
+
+	err := json.NewDecoder(r.Body).Decode(&req)
+
+	if err != nil {
+		http.Error(w, "Invalid Request", http.StatusBadRequest)
 		return
+	}
+
+	res, err := receiveSnapshot(req)
+	
+    if err != nil {
+        http.Error(w, "Failed to apply snapshot", http.StatusInternalServerError)
+        return
+    }
+
+	w.Header().Set("Content-Type", "application/json")
+	
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		http.Error(w, "Failed to apply snapshot", http.StatusInternalServerError)
 	}
 }

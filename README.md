@@ -12,7 +12,7 @@ Each Pod will have their own Log file that will store the operations requested b
 So client calls the gateway service, which in turn calls the gateway pod and which calls the leader pod in the K8s StatefulSet.
 
 <i>
-[Current state - basic Raft implemented with gateway & nodes locally.
+[Current state - basic Raft implemented with gateway & nodes locally (with snapshotting)
 <br/>
 Next step - Adding DB to the nodes to persist the data & removing in-memory KVStore.]
 </i>
