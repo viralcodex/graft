@@ -4,12 +4,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/oklog/ulid/v2"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
-	"github.com/oklog/ulid/v2"
 )
 
 type Gateway struct {
@@ -50,7 +50,7 @@ func parseCluster(cluster string) []string {
 func getFollowers(nodes []NodeStatus) []string {
 	followers := make([]string, 0, len(nodes))
 
-	for _,  node := range nodes {
+	for _, node := range nodes {
 		if node.Role == "follower" && node.Err == nil {
 			followers = append(followers, node.Addr)
 		}
@@ -104,7 +104,7 @@ func pollNode(addr string) NodeStatus {
 
 func main() {
 	port := flag.String("port", "7000", "Gateway port")
-	cluster := flag.String("cluster", "localhost:8000,localhost:8001,localhost:8002", "Comma-separated cluster addresses")
+	cluster := flag.String("cluster", "raft-peer-0.raft-peers:8000,raft-peer-1.raft-peers:8000,raft-peer-2.raft-peers:8000", "Comma-separated cluster addresses")
 	flag.Parse()
 
 	gw := &Gateway{
@@ -214,7 +214,7 @@ func reqNode(method string, url string, w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "bad request", http.StatusInternalServerError)
 		return
 	}
-	
+
 	reqId := getReqId(r)
 	req.Header.Set("X-Request-ID", reqId)
 

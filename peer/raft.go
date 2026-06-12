@@ -2,10 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"math/rand"
 	"net/http"
 	"os"
@@ -17,6 +17,7 @@ import (
 
 type RaftState struct {
 	mu sync.Mutex
+	stateMachineMu sync.Mutex //this locks when we are doing DB ops
 
 	nodeId   string
 	role     string
@@ -61,6 +62,7 @@ type LeaderIndexState struct {
 type SnapshotState struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
+	LastSnapshotAt    time.Time
 }
 
 type InstallSnapshotRequest struct {
@@ -77,47 +79,53 @@ type InstallSnapshotResponse struct {
 	Term int
 }
 
+// temp struct needed
+type snapshotPlan struct {
+	nodeId             string
+	stateDir           string
+	lastIncludedIndex  int
+	lastIncludedTerm   int
+	lastIncludedOffset int
+	baseSnapshotIndex  int
+	baseSnapshotTerm   int
+}
+
 // config
 var logSizeThreshold int64
 var unappliedLogEntries int
 
-func initConfig() {
-	value1, err := strconv.ParseInt(os.Getenv("DEV_LOG_SIZE"), 10, 64)
-
-	if err != nil {
-		fmt.Print(errors.New("Error parsing log size threshold"))
-		value1 = 512*1024
+func initRaftConfig() {
+	logSizeThreshold = 512 * 1024
+	if raw := os.Getenv("DEV_LOG_SIZE"); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			fmt.Printf("invalid DEV_LOG_SIZE %q, using default %d\n", raw, logSizeThreshold)
+		} else {
+			logSizeThreshold = value
+		}
 	}
 
-	logSizeThreshold = value1
-
-	value2, err := strconv.ParseInt(os.Getenv("UNAPPLIED_LOG_ENTRIES"), 10, 64)
-
-	if err != nil {
-		fmt.Print(errors.New("Error parsing unapplied log entries threshold"))
-		value2 = 2000
+	unappliedLogEntries = 2000
+	if raw := os.Getenv("UNAPPLIED_LOG_ENTRIES"); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			fmt.Printf("invalid UNAPPLIED_LOG_ENTRIES %q, using default %d\n", raw, unappliedLogEntries)
+		} else {
+			unappliedLogEntries = int(value)
+		}
 	}
-	unappliedLogEntries = int(value2)
 }
 
 var raftState RaftState
 var client = &http.Client{Timeout: 120 * time.Millisecond}
 
 func initRaftState(nodeId string, role string, peers []string, stateDir string) {
-	initConfig()
+	initRaftConfig()
 	persistantState := loadPersistantState(nodeId, stateDir)
-	snapshotState := loadSnapshotFile(nodeId, stateDir)
+	snapshotFile := loadSnapshotFile(nodeId, stateDir)
 
-	//init the store data from the snapshot
-	Store.mu.Lock()
-	Store.data = snapshotState.Data
-	Store.appliedReqIDs = snapshotState.AppliedReqIDs
-	Store.mu.Unlock()
-
-	indexState := IndexState{
-		CommitIndex: snapshotState.LastIncludedIndex,
-		LastApplied: snapshotState.LastIncludedIndex,
-	}
+	//reconciliate db and snapshot state then init indexState
+	indexState := reconcileSnapshotState(snapshotFile, persistantState)
 
 	leaderIndexState := LeaderIndexState{
 		NextIndex:  make(map[string]int),
@@ -125,8 +133,9 @@ func initRaftState(nodeId string, role string, peers []string, stateDir string) 
 	}
 
 	snapshotMetadata := SnapshotState{
-		LastIncludedIndex: snapshotState.LastIncludedIndex,
-		LastIncludedTerm:  snapshotState.LastIncludedTerm,
+		LastIncludedIndex: snapshotFile.LastIncludedIndex,
+		LastIncludedTerm:  snapshotFile.LastIncludedTerm,
+		LastSnapshotAt:    snapshotFile.LastSnapshotAt,
 	}
 
 	raftState = RaftState{
@@ -140,6 +149,45 @@ func initRaftState(nodeId string, role string, peers []string, stateDir string) 
 		leaderIndexState: leaderIndexState,
 		snapshotInFlight: make(map[string]bool),
 		snapshotState:    snapshotMetadata,
+	}
+}
+
+func reconcileSnapshotState(snapshotFile SnapshotFile, persistentState PersistentState) IndexState {
+	ctx, cancel := context.WithTimeout(context.Background(), 3 * time.Second)
+	defer cancel()
+
+	lastApplied, found, err := getRaftMetadata(ctx)
+
+	if err != nil {
+		panic(err)
+	}
+
+	if !found {
+		lastApplied = 0
+	}
+
+	var reconciledLastAppliedIndex int
+
+	if lastApplied == snapshotFile.LastIncludedIndex || lastApplied > snapshotFile.LastIncludedIndex {
+		reconciledLastAppliedIndex = lastApplied
+	}
+
+	//bring DB state upto the snapshot when behind
+	if lastApplied < snapshotFile.LastIncludedIndex {
+		if err = updateFromSnapshot(ctx, &snapshotFile); err != nil {
+			panic(err)
+		}
+		reconciledLastAppliedIndex = snapshotFile.LastIncludedIndex
+	}
+
+	//if lastApplied is out of bounds from absolute log index, panic
+	if lastApplied > snapshotFile.LastIncludedIndex + len(persistentState.Log) {
+		panic("Invalid lastApplied value")
+	}
+
+	return IndexState{
+		CommitIndex: reconciledLastAppliedIndex,
+		LastApplied: reconciledLastAppliedIndex,
 	}
 }
 
@@ -167,11 +215,33 @@ func persistLocked() {
 	}
 }
 
+// applies committed commands to the state machine and advances LastApplied only after success
+func applyCommittedCommands(commands []Command, appliedThrough int) {
+	if len(commands) == 0 {
+		return
+	}
+
+	//use a different mutex to prevent race condition on DB updates in db.go
+	raftState.stateMachineMu.Lock()
+	defer raftState.stateMachineMu.Unlock()
+
+	startIndex := appliedThrough - len(commands) + 1
+	for offset, command := range commands {
+		applyToStore(command, startIndex + offset)
+	}
+
+	raftState.mu.Lock()
+	if appliedThrough > raftState.indexState.LastApplied {
+		raftState.indexState.LastApplied = appliedThrough
+	}
+	raftState.mu.Unlock()
+} 
+
 /*
-commit the entries from commitIndex -> lastIndex (uncommitted entries) if majority nodes have replicated the entries sent from leader
-then apply those entries to the state machine (applyToStore)
+collect the entries from commitIndex -> lastIndex (uncommitted entries) if majority nodes have replicated the entries sent from leader
+and send it back for committing
 */
-func advanceCommitIndexLocked() {
+func advanceCommitIndexLocked() ([]Command, int, bool) {
 	lastIndex := getLastLogIndexLocked()
 
 	for i := lastIndex; i > raftState.indexState.CommitIndex; i-- {
@@ -188,74 +258,128 @@ func advanceCommitIndexLocked() {
 			}
 		}
 
-		//when majority, commit these entries to your log & apply to state machine
-		//if the threshold are met as a leader, snapshot the log
+		//when majority, return the commands to be applied
+		//if the threshold are met as a leader, return the flag to snapshot the log
 		if replicationNumber > (len(raftState.peers)+1)/2 {
 			raftState.indexState.CommitIndex = i
-			applyCommittedEntriesLocked()
+			commands, appliedThrough := collectCommittedEntriesLocked()
 
-			//currently only snapshotting as a leader, followers depend on leaders to send installSnapshot RPC
-			if raftState.role == "leader" {
-				maySnapshotLocked()
-			}
-			return
+			shouldSnapshot := raftState.role == "leader"
+
+			return commands, appliedThrough, shouldSnapshot
 		}
 	}
+	return nil, raftState.indexState.LastApplied, false
+}
+func buildSnapshotPlanLocked(logSize int64) (snapshotPlan, bool) {
+	//thresholds
+	cooldownPassed := raftState.snapshotState.LastSnapshotAt.IsZero() ||
+		time.Since(raftState.snapshotState.LastSnapshotAt) >= time.Minute
+	maxSizeReached := logSize > logSizeThreshold
+	uncompactedEntriesReached := raftState.indexState.LastApplied-raftState.snapshotState.LastIncludedIndex > unappliedLogEntries
+
+	if !cooldownPassed || (!maxSizeReached && !uncompactedEntriesReached) {
+		return snapshotPlan{}, false
+	}
+
+	lastIncludedIndex := raftState.indexState.LastApplied
+	if lastIncludedIndex <= raftState.snapshotState.LastIncludedIndex {
+		return snapshotPlan{}, false
+	}
+
+	lastIncludedOffset := getLogOffsetLocked(lastIncludedIndex) //absolute index - last snapshotted index
+	if lastIncludedOffset < 0 || lastIncludedOffset >= len(raftState.persistentState.Log) {
+		return snapshotPlan{}, false
+	}
+
+	lastLogEntry := raftState.persistentState.Log[lastIncludedOffset]
+
+	return snapshotPlan{
+		nodeId:             raftState.nodeId,
+		stateDir:           raftState.stateDir,
+		lastIncludedIndex:  lastLogEntry.Index,
+		lastIncludedTerm:   lastLogEntry.Term,
+		lastIncludedOffset: lastIncludedOffset,
+		baseSnapshotIndex:  raftState.snapshotState.LastIncludedIndex,
+		baseSnapshotTerm:   raftState.snapshotState.LastIncludedTerm,
+	}, true
 }
 
-func maySnapshotLocked() {
-	snapshot := loadSnapshotFile(raftState.nodeId, raftState.stateDir)
+func snapshotPlanStillValidLocked(plan snapshotPlan) bool {
+	if raftState.snapshotState.LastIncludedIndex != plan.baseSnapshotIndex ||
+		raftState.snapshotState.LastIncludedTerm != plan.baseSnapshotTerm ||
+		plan.lastIncludedIndex <= raftState.snapshotState.LastIncludedIndex ||
+		(plan.lastIncludedOffset < 0 || plan.lastIncludedOffset >= len(raftState.persistentState.Log)) {
+		return false
+	}
+
+	entry := raftState.persistentState.Log[plan.lastIncludedOffset]
+	return entry.Index == plan.lastIncludedIndex && entry.Term == plan.lastIncludedTerm
+}
+
+func maySnapshot() {
 	logPath := filepath.Join(raftState.stateDir, raftState.nodeId+".json")
 	info, err := os.Stat(logPath)
 	if err != nil {
 		return
 	}
 
-	cooldownPassed := snapshot.LastSnapshotAt.IsZero() || time.Since(snapshot.LastSnapshotAt) >= time.Minute
-	maxSizeReached := info.Size() > logSizeThreshold
-	uncompactedEntriesReached := raftState.indexState.LastApplied-raftState.snapshotState.LastIncludedIndex > unappliedLogEntries
+	raftState.stateMachineMu.Lock()
+	defer raftState.stateMachineMu.Unlock()
 
-	if !cooldownPassed || (!maxSizeReached && !uncompactedEntriesReached) {
+	raftState.mu.Lock()
+	plan, ok := buildSnapshotPlanLocked(info.Size())
+	raftState.mu.Unlock()
+	if !ok {
 		return
 	}
 
-	lastIncludedIndex := raftState.indexState.LastApplied
-	if lastIncludedIndex <= raftState.snapshotState.LastIncludedIndex {
+	snapshotFile := SnapshotFile{
+		Data:          make(map[string]string),
+		AppliedReqIDs: make(map[string]AppliedResult),
+	}
+
+	ctx, cancel := dbContext()
+	defer cancel()
+
+	if err := updateSnapshotFromDB(ctx, &snapshotFile); err != nil {
+		panic(err)
+	}
+
+	snapshotFile.LastIncludedIndex = plan.lastIncludedIndex
+	snapshotFile.LastIncludedTerm = plan.lastIncludedTerm
+	snapshotFile.LastSnapshotAt = time.Now()
+
+	tempSnapshotPath := filepath.Join(plan.stateDir, plan.nodeId+".snapshot.new")
+	finalSnapshotPath := filepath.Join(plan.stateDir, plan.nodeId+".snapshot.json")
+
+	if err := saveSnapshotFileAtPath(tempSnapshotPath, snapshotFile); err != nil {
 		return
 	}
-	lastIncludedOffset := getLogOffsetLocked(lastIncludedIndex) //relative index (absolute - last snapshot index)
 
-	lastLogEntry := raftState.persistentState.Log[lastIncludedOffset]
+	raftState.mu.Lock()
 
-	Store.mu.Lock()
-	//reset then copy to prevent stale data
-	snapshot.Data = make(map[string]string)
-	snapshot.AppliedReqIDs = make(map[string]AppliedResult)
-
-	maps.Copy(snapshot.Data, Store.data)
-	maps.Copy(snapshot.AppliedReqIDs, Store.appliedReqIDs)
-
-	Store.mu.Unlock()
-
-	snapshot.LastIncludedIndex = lastLogEntry.Index
-	snapshot.LastIncludedTerm = lastLogEntry.Term
-	snapshot.LastSnapshotAt = time.Now()
-
-	err = saveSnapshotFile(raftState.nodeId, raftState.stateDir, snapshot)
-
-	if err != nil {
+	if !snapshotPlanStillValidLocked(plan) {
+		raftState.mu.Unlock()
+		_ = os.Remove(tempSnapshotPath)
 		return
 	}
 
 	raftState.snapshotState = SnapshotState{
-		LastIncludedIndex: snapshot.LastIncludedIndex,
-		LastIncludedTerm:  snapshot.LastIncludedTerm,
+		LastIncludedIndex: snapshotFile.LastIncludedIndex,
+		LastIncludedTerm:  snapshotFile.LastIncludedTerm,
+		LastSnapshotAt:    snapshotFile.LastSnapshotAt,
 	}
 
-	//truncate the log
-	raftState.persistentState.Log = append([]LogEntry(nil), raftState.persistentState.Log[lastIncludedOffset+1:]...)
+	raftState.persistentState.Log = append([]LogEntry(nil), raftState.persistentState.Log[plan.lastIncludedOffset+1:]...)
 
 	persistLocked() //save the updated log
+	raftState.mu.Unlock()
+
+	//update the snapshot file now
+	if err := os.Rename(tempSnapshotPath, finalSnapshotPath); err != nil {
+		panic(err)
+	}
 }
 
 // returns absolute log offset index based on last snapshot index [absolute index - last snapshotted log index]
@@ -283,13 +407,15 @@ func logTermAtLocked(index int) (int, bool) {
 	return raftState.persistentState.Log[offset].Term, true
 }
 
-func applyCommittedEntriesLocked() {
-	for raftState.indexState.LastApplied < raftState.indexState.CommitIndex {
-		raftState.indexState.LastApplied++
-		offset := getLogOffsetLocked(raftState.indexState.LastApplied)
-		currCommand := raftState.persistentState.Log[offset].Command
-		applyToStore(currCommand)
+func collectCommittedEntriesLocked() ([]Command, int) {
+	var commands []Command
+	nextApplied := raftState.indexState.LastApplied
+	for nextApplied < raftState.indexState.CommitIndex {
+		nextApplied++
+		offset := getLogOffsetLocked(nextApplied)
+		commands = append(commands, raftState.persistentState.Log[offset].Command)
 	}
+	return commands, nextApplied
 }
 
 func loadPersistantState(nodeId string, stateDir string) PersistentState {
@@ -351,7 +477,7 @@ func savePersistentState(state PersistentState, nodeId string, stateDir string) 
 /*
 apply the request to the state machine (persistent storage)
 */
-func applyToStore(command Command) AppliedResult {
+func applyToStore(command Command, lastAppliedIndex int) AppliedResult {
 	result := AppliedResult{
 		Found: false,
 	}
@@ -360,27 +486,25 @@ func applyToStore(command Command) AppliedResult {
 		return result
 	}
 
-	Store.mu.Lock()
-	defer Store.mu.Unlock()
+	ctx, cancel := dbContext()
+	defer cancel()
 
-	if result, ok := Store.appliedReqIDs[command.ReqId]; ok {
+	switch command.Operation {
+	case "PUT":
+		result, err := updateValue(ctx, command.Key, command.Value, command.ReqId, lastAppliedIndex)
+		if err != nil {
+			panic(err)
+		}
 		return result
-	}
 
-	if command.Operation == "PUT" {
-		Store.data[command.Key] = command.Value
-		result.Found = true
-		result.Value = command.Value
-		Store.appliedReqIDs[command.ReqId] = result
-	}
+	case "DELETE":
+		result, err := deleteValue(ctx, command.Key, command.ReqId, lastAppliedIndex)
+		if err != nil {
+			panic(err)
+		}
+		return result
 
-	if command.Operation == "DELETE" {
-		_, ok := Store.data[command.Key]
-		result.Found = ok
-		Store.appliedReqIDs[command.ReqId] = result
-		delete(Store.data, command.Key)
 	}
-
 	return result
 }
 
@@ -394,19 +518,26 @@ if not, we try to see if the entry is already present in the log.
 if not, we append it to the log and then keep waiting for 2 seconds until the entry is applied to state machine & return if done or not
 */
 func submitCommand(command Command) bool {
+	//first dedupe check then proceed
+
+	ctx, cancel := dbContext()
+	defer cancel()
+
+	_, found, err := appliedRequestExist(ctx, &command.ReqId)
+
+	if err != nil {
+		panic(err)
+	}
+
+	if found {
+		return true
+	}
+
 	raftState.mu.Lock()
 
 	if raftState.role != "leader" {
 		raftState.mu.Unlock()
 		return false
-	}
-
-	Store.mu.Lock()
-	_, ok := Store.appliedReqIDs[command.ReqId]
-	Store.mu.Unlock()
-
-	if ok {
-		return true
 	}
 
 	existingIndex := 0
@@ -435,7 +566,7 @@ func submitCommand(command Command) bool {
 
 	timeout := time.Now().Add(2 * time.Second)
 
-	//keeps checking for 2 seconds until timeout that the entry is committed or the leadership is lost
+	//keeps checking for 2s until timeout that the entry is committed or the leadership is lost
 	for time.Now().Before(timeout) {
 		raftState.mu.Lock()
 		isSaved := raftState.indexState.LastApplied >= existingIndex
@@ -713,25 +844,35 @@ func sendAppendEntries() {
 				if err != nil {
 					return
 				}
+
 				raftState.mu.Lock()
-				defer raftState.mu.Unlock()
 
 				if raftState.role != "leader" || raftState.persistentState.CurrentTerm != req.Term {
+					raftState.mu.Unlock()
 					return
 				}
 
 				if resp.Term > raftState.persistentState.CurrentTerm {
 					stepDownLocked(resp.Term)
+					raftState.mu.Unlock()
 					return
 				}
 
 				//on success from the follower, we increase the next and match index ahead by how many entries are replicated for this node & advance the commit index
+				//and apply the commands to the DB (and snapshot)
 				if resp.Success {
 					replicatedIndex := req.PrevLogIndex + len(req.Entries)
 					raftState.leaderIndexState.MatchIndex[addr] = replicatedIndex
 					raftState.leaderIndexState.NextIndex[addr] = replicatedIndex + 1
 
-					advanceCommitIndexLocked()
+					commands, appliedThrough, shouldSnapshot := advanceCommitIndexLocked()
+					raftState.mu.Unlock()
+
+					applyCommittedCommands(commands, appliedThrough)
+
+					if shouldSnapshot {
+						maySnapshot()
+					}
 					return
 				}
 
@@ -739,6 +880,7 @@ func sendAppendEntries() {
 				if raftState.leaderIndexState.NextIndex[addr] > 1 {
 					raftState.leaderIndexState.NextIndex[addr]--
 				}
+				raftState.mu.Unlock()
 			}(peer, appendReq)
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -781,18 +923,22 @@ then it appends the entries (From the req) from that point to the follower's log
 */
 func receiveAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 	raftState.mu.Lock()
-	defer raftState.mu.Unlock()
 
 	if req.Term < raftState.persistentState.CurrentTerm {
+		currentTerm := raftState.persistentState.CurrentTerm
+		raftState.mu.Unlock()
 		return AppendEntriesResponse{
-			Term:    raftState.persistentState.CurrentTerm,
+			Term:    currentTerm,
 			Success: false,
 		}
 	}
 
+	stepDownLocked(req.Term)
 	if req.PrevLogIndex > getLastLogIndexLocked() {
+		currentTerm := raftState.persistentState.CurrentTerm
+		raftState.mu.Unlock()
 		return AppendEntriesResponse{
-			Term:    raftState.persistentState.CurrentTerm,
+			Term:    currentTerm,
 			Success: false,
 		}
 	}
@@ -800,8 +946,10 @@ func receiveAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 	if req.PrevLogIndex > 0 {
 		prevLogTerm, ok := logTermAtLocked(req.PrevLogIndex)
 		if !ok || prevLogTerm != req.PrevLogTerm {
+			currentTerm := raftState.persistentState.CurrentTerm
+			raftState.mu.Unlock()
 			return AppendEntriesResponse{
-				Term:    raftState.persistentState.CurrentTerm,
+				Term:    currentTerm,
 				Success: false,
 			}
 		}
@@ -837,12 +985,16 @@ func receiveAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 	//move the committed state ahead if leader has committed till ahead
 	raftState.indexState.CommitIndex = min(req.LeaderCommitIndex, getLastLogIndexLocked())
 
-	applyCommittedEntriesLocked()
+	commands, appliedThrough := collectCommittedEntriesLocked()
+	currentTerm := raftState.persistentState.CurrentTerm
 
-	stepDownLocked(req.Term) //step down if you're behind in terms
+	raftState.mu.Unlock()
+
+	//apply commands to DB
+	applyCommittedCommands(commands, appliedThrough)
 
 	return AppendEntriesResponse{
-		Term:    raftState.persistentState.CurrentTerm,
+		Term:    currentTerm,
 		Success: true,
 	}
 }
@@ -873,7 +1025,10 @@ func requestVote(peer string, req VoteRequest) (VoteResponse, error) {
 
 func loadSnapshotFile(nodeId string, stateDir string) SnapshotFile {
 	path := filepath.Join(stateDir, nodeId+".snapshot.json")
+	return loadSnapshotFileAtPath(path)
+}
 
+func loadSnapshotFileAtPath(path string) SnapshotFile {
 	bytes, err := os.ReadFile(path)
 
 	if err != nil {
@@ -903,24 +1058,26 @@ func loadSnapshotFile(nodeId string, stateDir string) SnapshotFile {
 	if snapshot.AppliedReqIDs == nil {
 		snapshot.AppliedReqIDs = make(map[string]AppliedResult)
 	}
-
 	return snapshot
 }
 
 func saveSnapshotFile(nodeId string, stateDir string, snapshot SnapshotFile) error {
+	path := filepath.Join(stateDir, nodeId+".snapshot.json")
+	return saveSnapshotFileAtPath(path, snapshot)
+}
+
+func saveSnapshotFileAtPath(path string, snapshot SnapshotFile) error {
+	stateDir := filepath.Dir(path)
 
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return err
 	}
-
-	path := filepath.Join(stateDir, nodeId+".snapshot.json")
 
 	bytes, err := json.MarshalIndent(snapshot, "", "	")
 
 	if err != nil {
 		return err
 	}
-
 	return os.WriteFile(path, bytes, 0o644)
 }
 
@@ -1094,24 +1251,25 @@ func receiveSnapshot(req InstallSnapshotRequest) (InstallSnapshotResponse, error
 		}, nil
 	}
 
-	//now the done is true, so we save the file
+	//now the done is true, so we can publish the snapshot after the matching raft state is durable
 	finalSnapshotPath := filepath.Join(stateDir, nodeId+".snapshot.json")
 
 	//sync then close for no unexpected issues later
 	if err := file.Sync(); err != nil {
 		return InstallSnapshotResponse{}, err
 	}
-
 	if err := file.Close(); err != nil {
 		return InstallSnapshotResponse{}, err
 	}
+	
 	fileClosed = true
 
-	if err := os.Rename(tempSnapshotPath, finalSnapshotPath); err != nil {
-		return InstallSnapshotResponse{}, err
-	}
+	snapshotFile := loadSnapshotFileAtPath(tempSnapshotPath)
+	raftState.stateMachineMu.Lock()
+	defer raftState.stateMachineMu.Unlock()
 
-	snapshotFile := loadSnapshotFile(nodeId, stateDir)
+	ctx, cancel := dbContext()
+	defer cancel()
 
 	raftState.mu.Lock()
 	//staleness leader check
@@ -1148,6 +1306,11 @@ func receiveSnapshot(req InstallSnapshotRequest) (InstallSnapshotResponse, error
 		raftState.indexState.CommitIndex = snapshotFile.LastIncludedIndex
 	}
 
+	//update DB then update the lastIncludedIndex
+	if err := updateFromSnapshot(ctx, &snapshotFile); err != nil {
+		panic(err)
+	}
+
 	if raftState.indexState.LastApplied < snapshotFile.LastIncludedIndex {
 		raftState.indexState.LastApplied = snapshotFile.LastIncludedIndex
 	}
@@ -1156,11 +1319,9 @@ func receiveSnapshot(req InstallSnapshotRequest) (InstallSnapshotResponse, error
 	persistLocked()
 	raftState.mu.Unlock()
 
-	//update the state machine with the snapshot
-	Store.mu.Lock()
-	Store.data = snapshotFile.Data
-	Store.appliedReqIDs = snapshotFile.AppliedReqIDs
-	Store.mu.Unlock()
+	if err := os.Rename(tempSnapshotPath, finalSnapshotPath); err != nil {
+		return InstallSnapshotResponse{}, err
+	}
 
 	return InstallSnapshotResponse{
 		Term: currentTerm,

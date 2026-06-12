@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
-	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 )
 
 type PutRequest struct {
@@ -59,21 +64,21 @@ type AppendEntriesResponse struct {
 }
 
 type Command struct {
-	ReqId     string 
-	Operation string 
-	Key       string 
+	ReqId     string
+	Operation string
+	Key       string
 	Value     string
 }
 
 func setupConfig() (string, string, string, []string, string) {
 	port := flag.String("port", "8000", "HTTP server port")
 	nodeId := flag.String("nodeId", "node1", "nodeId for the server")
-	cluster := flag.String("cluster", "localhost:8000,localhost:8001,localhost:8002", "Comma-separated cluster addresses")
+	cluster := flag.String("cluster", "raft-peer-0.raft-peers:8000,raft-peer-1.raft-peers:8000,raft-peer-2.raft-peers:8000", "Comma-separated cluster addresses")
 	stateDir := flag.String("stateDir", "state", "Directory for persisted raft state")
 	role := "follower"
 	flag.Parse()
 
-	selfAddr := "localhost:" + *port
+	selfAddr := *nodeId + ".raft-peers:" + *port
 	rawNodes := strings.Split(*cluster, ",")
 	peers := make([]string, 0, len(rawNodes))
 
@@ -88,33 +93,74 @@ func setupConfig() (string, string, string, []string, string) {
 	return *port, *nodeId, role, peers, *stateDir
 }
 
-func startServer(port string) error {
-	addr := ":" + port
-	fmt.Println("Server running on", port)
-	return http.ListenAndServe(addr, nil)
+func startServer(port string, mux *http.ServeMux) (error) {
+	server := &http.Server{
+		Addr: ":" + port,
+		Handler: mux,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errorChannel := make(chan error, 1)
+
+	go func() {
+		errorChannel <- server.ListenAndServe()
+	}()
+
+	//handle graceful shutdown (1. for interruption signals/errors 2. for server errors)
+	select {
+	case err := <-errorChannel:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+		defer cancel()
+		
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+		}
+	}
+	return nil
+}
+
+func initDBConfig() (error) {
+	err := initDB()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func main() {
 	port, nodeId, role, peers, stateDir := setupConfig()
+	
+	if err := initDBConfig(); err != nil {
+		panic(err)
+	}
+	
+	defer dbPool.Close()
+	
 	initRaftState(nodeId, role, peers, stateDir)
-
 	go runElectionTimer() //start the timer
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { rootHandler(w, r) })
-	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { statusHandler(w, r, port, nodeId) })
-	http.HandleFunc("GET /kv/{key}", func(w http.ResponseWriter, r *http.Request) { getValueHandler(w, r) })
-	http.HandleFunc("PUT /kv/{key}", func(w http.ResponseWriter, r *http.Request) { putValueHandler(w, r) })
-	http.HandleFunc("DELETE /kv/{key}", func(w http.ResponseWriter, r *http.Request) { deleteValueHandler(w, r) })
-	http.HandleFunc("POST /vote", func(w http.ResponseWriter, r *http.Request) { requestVoteHandler(w, r) })
-	http.HandleFunc("POST /appendEntries", func(w http.ResponseWriter, r *http.Request) { appendEntriesHandler(w, r) })
-	http.HandleFunc("POST /snapshot", func(w http.ResponseWriter, r *http.Request) {receiveSnapshotHandler(w, r)})
-	if err := startServer(port); err != nil {
-		fmt.Println("Error starting server:", err)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { rootHandler(w, r) })
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { statusHandler(w, r, port, nodeId) })
+	mux.HandleFunc("GET /kv/{key}", func(w http.ResponseWriter, r *http.Request) { getValueHandler(w, r) })
+	mux.HandleFunc("PUT /kv/{key}", func(w http.ResponseWriter, r *http.Request) { putValueHandler(w, r) })
+	mux.HandleFunc("DELETE /kv/{key}", func(w http.ResponseWriter, r *http.Request) { deleteValueHandler(w, r) })
+	mux.HandleFunc("POST /vote", func(w http.ResponseWriter, r *http.Request) { requestVoteHandler(w, r) })
+	mux.HandleFunc("POST /appendEntries", func(w http.ResponseWriter, r *http.Request) { appendEntriesHandler(w, r) })
+	mux.HandleFunc("POST /snapshot", func(w http.ResponseWriter, r *http.Request) { receiveSnapshotHandler(w, r) })
+	
+	if err := startServer(port, mux); err != nil {
+		panic(err)
 	}
 }
 
 func rootHandler(w http.ResponseWriter, _ *http.Request) {
-
 	w.Header().Set("Content-Type", "application/json")
 
 	err := json.NewEncoder(w).Encode(RootResponse{
@@ -148,10 +194,12 @@ func statusHandler(w http.ResponseWriter, _ *http.Request, port string, nodeId s
 func getValueHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
-	Store.mu.RLock()
-	value, ok := Store.data[key]
-	Store.mu.RUnlock()
+	value, ok, err := getValue(r.Context(), key)
 
+	if err != nil {
+		http.Error(w, "failed to get value", http.StatusInternalServerError)
+		return
+	}
 	if !ok {
 		http.Error(w, "No record for this key", http.StatusNotFound)
 		return
@@ -159,7 +207,7 @@ func getValueHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	err := json.NewEncoder(w).Encode(GetAndPutResponse{
+	err = json.NewEncoder(w).Encode(GetAndPutResponse{
 		Key:   key,
 		Value: value,
 	})
@@ -285,14 +333,14 @@ func receiveSnapshotHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := receiveSnapshot(req)
-	
-    if err != nil {
-        http.Error(w, "Failed to apply snapshot", http.StatusInternalServerError)
-        return
-    }
+
+	if err != nil {
+		http.Error(w, "Failed to apply snapshot", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	if err := json.NewEncoder(w).Encode(res); err != nil {
 		http.Error(w, "Failed to apply snapshot", http.StatusInternalServerError)
 	}

@@ -51,6 +51,17 @@ type clusterOptions struct {
 	peerEnv map[string]string
 }
 
+type postgresBackend struct {
+	name string
+	port int
+}
+
+type clusterHandle struct {
+	processes     []*clusterProcess
+	postgres      []*postgresBackend
+	peerEnvByNode map[string]map[string]string
+}
+
 type clusterProcess struct {
 	name   string
 	cmd    *exec.Cmd
@@ -85,18 +96,18 @@ func TestLeaderCreatesSnapshotAndCompactsLog(t *testing.T) {
 	gatewayPort := ports[0]
 	peerPorts := ports[1:]
 	cluster := clusterAddrs(peerPorts)
-	processes := startClusterWithOptions(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir, clusterOptions{
+	clusterRun := startClusterWithOptions(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir, clusterOptions{
 		peerEnv: map[string]string{
 			"DEV_LOG_SIZE":          strconv.FormatInt(1<<30, 10),
 			"UNAPPLIED_LOG_ENTRIES": "1",
 		},
 	})
-	defer stopCluster(t, processes)
+	defer stopCluster(t, clusterRun)
 
 	client := &http.Client{Timeout: time.Second}
 	baseURL := fmt.Sprintf("http://localhost:%d", gatewayPort)
 
-	state := waitForLeader(t, client, baseURL, 10*time.Second)
+	state := waitForLeader(t, client, baseURL, len(cluster)-1, 10*time.Second)
 
 	for idx := 0; idx < 3; idx++ {
 		key := fmt.Sprintf("snapshot-key-%d", idx)
@@ -155,20 +166,20 @@ func TestFollowerCatchesUpFromSnapshotAfterRestart(t *testing.T) {
 		"DEV_LOG_SIZE":          strconv.FormatInt(1<<30, 10),
 		"UNAPPLIED_LOG_ENTRIES": "1",
 	}
-	processes := startClusterWithOptions(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir, clusterOptions{peerEnv: peerEnv})
-	defer stopCluster(t, processes)
+	clusterRun := startClusterWithOptions(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir, clusterOptions{peerEnv: peerEnv})
+	defer stopCluster(t, clusterRun)
 
 	client := &http.Client{Timeout: time.Second}
 	baseURL := fmt.Sprintf("http://localhost:%d", gatewayPort)
 
-	state := waitForLeader(t, client, baseURL, 10*time.Second)
+	state := waitForLeader(t, client, baseURL, len(cluster)-1, 10*time.Second)
 	if len(state.Followers) == 0 {
 		t.Fatal("expected at least one follower")
 	}
 
 	laggingFollowerAddr := state.Followers[0]
 	laggingFollowerNodeID := nodeIDForAddr(t, cluster, laggingFollowerAddr)
-	laggingFollowerProc := peerProcessForAddr(t, processes, cluster, laggingFollowerAddr)
+	laggingFollowerProc := peerProcessForAddr(t, clusterRun.processes, cluster, laggingFollowerAddr)
 	stopProcess(laggingFollowerProc)
 
 	keys := []string{"offline-key-0", "offline-key-1", "offline-key-2"}
@@ -187,13 +198,13 @@ func TestFollowerCatchesUpFromSnapshotAfterRestart(t *testing.T) {
 		return snapshot.LastIncludedIndex >= 2 && len(persisted.Log) <= 1
 	}, 10*time.Second)
 
-	restartedFollower := startProcess(t, repoRoot, laggingFollowerNodeID, binaries["peer"], peerEnv,
+	restartedFollower := startProcess(t, repoRoot, laggingFollowerNodeID, binaries["peer"], clusterRun.peerEnvByNode[laggingFollowerNodeID],
 		"-port", strconv.Itoa(portForAddr(t, laggingFollowerAddr)),
 		"-nodeId", laggingFollowerNodeID,
-		"-cluster", strings.Join(cluster, ","),
+		"-cluster", peerClusterFlag(cluster, nodeIndexForID(t, laggingFollowerNodeID)),
 		"-stateDir", filepath.Join(stateDir, laggingFollowerNodeID),
 	)
-	replaceProcessForAddr(t, processes, cluster, laggingFollowerAddr, restartedFollower)
+	replaceProcessForAddr(t, clusterRun.processes, cluster, laggingFollowerAddr, restartedFollower)
 	waitForEndpoint(t, fmt.Sprintf("http://%s/health", laggingFollowerAddr), 5*time.Second)
 
 	for idx, key := range keys {
@@ -227,13 +238,13 @@ func runGatewayClientFlow(t *testing.T, peerCount int, key string, value string)
 	peerPorts := ports[1:]
 	cluster := clusterAddrs(peerPorts)
 
-	processes := startCluster(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir)
-	defer stopCluster(t, processes)
+	clusterRun := startCluster(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir)
+	defer stopCluster(t, clusterRun)
 
 	client := &http.Client{Timeout: time.Second}
 	baseURL := fmt.Sprintf("http://localhost:%d", gatewayPort)
 
-	state := waitForLeader(t, client, baseURL, 10*time.Second)
+	state := waitForLeader(t, client, baseURL, len(cluster)-1, 10*time.Second)
 	if state.Leader == "" {
 		t.Fatal("gateway state did not report a leader")
 	}
@@ -286,13 +297,13 @@ func runGatewayLeaderFailoverFlow(t *testing.T, peerCount int, key string, value
 	peerPorts := ports[1:]
 	cluster := clusterAddrs(peerPorts)
 
-	processes := startCluster(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir)
-	defer stopCluster(t, processes)
+	clusterRun := startCluster(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir)
+	defer stopCluster(t, clusterRun)
 
 	client := &http.Client{Timeout: time.Second}
 	baseURL := fmt.Sprintf("http://localhost:%d", gatewayPort)
 
-	state := waitForLeader(t, client, baseURL, 10*time.Second)
+	state := waitForLeader(t, client, baseURL, len(cluster)-1, 10*time.Second)
 	knownNodes := make(map[string]struct{}, len(cluster))
 	for _, addr := range cluster {
 		knownNodes[addr] = struct{}{}
@@ -308,7 +319,7 @@ func runGatewayLeaderFailoverFlow(t *testing.T, peerCount int, key string, value
 		waitForPeerValue(t, client, follower, key, value, 5*time.Second)
 	}
 
-	leaderProc := peerProcessForAddr(t, processes, cluster, state.Leader)
+	leaderProc := peerProcessForAddr(t, clusterRun.processes, cluster, state.Leader)
 	stopProcess(leaderProc)
 
 	remainingNodes := make(map[string]struct{}, len(cluster)-1)
@@ -319,7 +330,7 @@ func runGatewayLeaderFailoverFlow(t *testing.T, peerCount int, key string, value
 		remainingNodes[addr] = struct{}{}
 	}
 
-	stateAfterFailover := waitForDifferentLeader(t, client, baseURL, state.Leader, 10*time.Second)
+	stateAfterFailover := waitForDifferentLeader(t, client, baseURL, state.Leader, len(remainingNodes)-1, 10*time.Second)
 	if _, ok := remainingNodes[stateAfterFailover.Leader]; !ok {
 		t.Fatalf("new leader %q not in surviving cluster", stateAfterFailover.Leader)
 	}
@@ -362,7 +373,7 @@ func repoRoot(t *testing.T) string {
 	if !ok {
 		t.Fatal("failed to resolve test file path")
 	}
-	return filepath.Dir(filepath.Dir(filePath))
+	return filepath.Dir(filepath.Dir(filepath.Dir(filePath)))
 }
 
 func buildBinaries(t *testing.T, repoRoot string) map[string]string {
@@ -426,29 +437,43 @@ func clusterAddrs(ports []int) []string {
 	return addrs
 }
 
-func startCluster(t *testing.T, repoRoot string, binaries map[string]string, gatewayPort int, peerPorts []int, cluster []string, stateDir string) []*clusterProcess {
+func startCluster(t *testing.T, repoRoot string, binaries map[string]string, gatewayPort int, peerPorts []int, cluster []string, stateDir string) *clusterHandle {
 	t.Helper()
 	return startClusterWithOptions(t, repoRoot, binaries, gatewayPort, peerPorts, cluster, stateDir, clusterOptions{})
 }
 
-func startClusterWithOptions(t *testing.T, repoRoot string, binaries map[string]string, gatewayPort int, peerPorts []int, cluster []string, stateDir string, options clusterOptions) []*clusterProcess {
+func startClusterWithOptions(t *testing.T, repoRoot string, binaries map[string]string, gatewayPort int, peerPorts []int, cluster []string, stateDir string, options clusterOptions) *clusterHandle {
 	t.Helper()
 
-	processes := make([]*clusterProcess, 0, len(peerPorts)+1)
+	handle := &clusterHandle{
+		processes:     make([]*clusterProcess, 0, len(peerPorts)+1),
+		peerEnvByNode: make(map[string]map[string]string, len(peerPorts)),
+	}
+	t.Cleanup(func() {
+		stopCluster(t, handle)
+	})
+
+	handle.postgres = startPostgresBackends(t, len(peerPorts))
 	clusterFlag := strings.Join(cluster, ",")
 
 	for idx, port := range peerPorts {
+		nodeID := fmt.Sprintf("node%d", idx+1)
 		nodeStateDir := filepath.Join(stateDir, fmt.Sprintf("node%d", idx+1))
-		proc := startProcess(t, repoRoot, fmt.Sprintf("peer-%d", idx+1), binaries["peer"], options.peerEnv,
+		peerEnv := mergeEnv(options.peerEnv, map[string]string{
+			"DATABASE_URL": databaseURLForPort(handle.postgres[idx].port),
+		})
+		handle.peerEnvByNode[nodeID] = peerEnv
+
+		proc := startProcess(t, repoRoot, fmt.Sprintf("peer-%d", idx+1), binaries["peer"], peerEnv,
 			"-port", strconv.Itoa(port),
-			"-nodeId", fmt.Sprintf("node%d", idx+1),
-			"-cluster", clusterFlag,
+			"-nodeId", nodeID,
+			"-cluster", peerClusterFlag(cluster, idx),
 			"-stateDir", nodeStateDir,
 		)
-		processes = append(processes, proc)
+		handle.processes = append(handle.processes, proc)
 	}
 
-	processes = append(processes, startProcess(t, repoRoot, "gateway", binaries["gateway"], nil,
+	handle.processes = append(handle.processes, startProcess(t, repoRoot, "gateway", binaries["gateway"], nil,
 		"-port", strconv.Itoa(gatewayPort),
 		"-cluster", clusterFlag,
 	))
@@ -458,7 +483,135 @@ func startClusterWithOptions(t *testing.T, repoRoot string, binaries map[string]
 	}
 	waitForEndpoint(t, fmt.Sprintf("http://localhost:%d/raft/state", gatewayPort), 5*time.Second)
 
-	return processes
+	return handle
+}
+
+func startPostgresBackends(t *testing.T, count int) []*postgresBackend {
+	t.Helper()
+	ensureDockerAvailable(t)
+
+	ports := reservePorts(t, count)
+	prefix := dockerNamePrefix(t)
+	backends := make([]*postgresBackend, 0, count)
+
+	for idx, port := range ports {
+		backend := &postgresBackend{
+			name: fmt.Sprintf("%s-pg-%d", prefix, idx+1),
+			port: port,
+		}
+
+		cmd := exec.Command(
+			"docker", "run", "-d",
+			"--name", backend.name,
+			"-p", fmt.Sprintf("%d:5432", backend.port),
+			"--health-cmd=pg_isready -U raft -d raft",
+			"--health-interval=2s",
+			"--health-timeout=2s",
+			"--health-retries=30",
+			"-e", "POSTGRES_DB=raft",
+			"-e", "POSTGRES_USER=raft",
+			"-e", "POSTGRES_PASSWORD=raft",
+			"postgres:16-alpine",
+		)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("start postgres backend %s: %v\n%s", backend.name, err, output)
+		}
+
+		waitForPostgresHealthy(t, backend)
+		backends = append(backends, backend)
+	}
+
+	return backends
+}
+
+func ensureDockerAvailable(t *testing.T) {
+	t.Helper()
+
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is required for e2e tests")
+	}
+
+	cmd := exec.Command("docker", "version", "--format", "{{.Server.Version}}")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("docker server is unavailable: %v\n%s", err, output)
+	}
+}
+
+func waitForPostgresHealthy(t *testing.T, backend *postgresBackend) {
+	t.Helper()
+
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		cmd := exec.Command("docker", "inspect", "-f", "{{.State.Health.Status}}", backend.name)
+		output, err := cmd.CombinedOutput()
+		if err == nil && strings.TrimSpace(string(output)) == "healthy" {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	logsCmd := exec.Command("docker", "logs", backend.name)
+	logs, _ := logsCmd.CombinedOutput()
+	t.Fatalf("postgres backend %s did not become healthy\n%s", backend.name, logs)
+}
+
+func databaseURLForPort(port int) string {
+	return fmt.Sprintf("postgres://raft:raft@127.0.0.1:%d/raft?sslmode=disable", port)
+}
+
+func peerClusterFlag(cluster []string, selfIndex int) string {
+	entries := make([]string, 0, len(cluster))
+	for idx, addr := range cluster {
+		if idx == selfIndex {
+			entries = append(entries, fmt.Sprintf("node%d.raft-peers:%d", idx+1, portForAddrText(addr)))
+			continue
+		}
+		entries = append(entries, addr)
+	}
+	return strings.Join(entries, ",")
+}
+
+func portForAddrText(addr string) int {
+	_, portText, ok := strings.Cut(addr, ":")
+	if !ok {
+		return 0
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return 0
+	}
+	return port
+}
+
+func dockerNamePrefix(t *testing.T) string {
+	t.Helper()
+
+	name := strings.ToLower(t.Name())
+	name = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return '-'
+	}, name)
+
+	return fmt.Sprintf("raft-e2e-%s-%d", name, time.Now().UnixNano())
+}
+
+func mergeEnv(base map[string]string, extra map[string]string) map[string]string {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+
+	merged := make(map[string]string, len(base)+len(extra))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range extra {
+		merged[key] = value
+	}
+
+	return merged
 }
 
 func startProcess(t *testing.T, repoRoot string, name string, binary string, env map[string]string, args ...string) *clusterProcess {
@@ -547,6 +700,21 @@ func nodeIDForAddr(t *testing.T, cluster []string, addr string) string {
 	return ""
 }
 
+func nodeIndexForID(t *testing.T, nodeID string) int {
+	t.Helper()
+
+	if !strings.HasPrefix(nodeID, "node") {
+		t.Fatalf("unexpected node id %q", nodeID)
+	}
+
+	index, err := strconv.Atoi(strings.TrimPrefix(nodeID, "node"))
+	if err != nil || index <= 0 {
+		t.Fatalf("parse node index from %q: %v", nodeID, err)
+	}
+
+	return index - 1
+}
+
 func portForAddr(t *testing.T, addr string) int {
 	t.Helper()
 
@@ -563,10 +731,13 @@ func portForAddr(t *testing.T, addr string) int {
 	return port
 }
 
-func stopCluster(t *testing.T, processes []*clusterProcess) {
+func stopCluster(t *testing.T, handle *clusterHandle) {
 	t.Helper()
+	if handle == nil {
+		return
+	}
 
-	for _, proc := range processes {
+	for _, proc := range handle.processes {
 		if proc == nil || proc.cmd == nil || proc.cmd.Process == nil {
 			continue
 		}
@@ -576,6 +747,19 @@ func stopCluster(t *testing.T, processes []*clusterProcess) {
 			t.Logf("%s stdout:\n%s", proc.name, proc.stdout.String())
 			t.Logf("%s stderr:\n%s", proc.name, proc.stderr.String())
 		}
+	}
+
+	for _, backend := range handle.postgres {
+		if backend == nil || backend.name == "" {
+			continue
+		}
+		if t.Failed() {
+			logsCmd := exec.Command("docker", "logs", backend.name)
+			if logs, err := logsCmd.CombinedOutput(); err == nil && len(logs) > 0 {
+				t.Logf("%s logs:\n%s", backend.name, logs)
+			}
+		}
+		_ = exec.Command("docker", "rm", "-f", backend.name).Run()
 	}
 }
 
@@ -606,7 +790,7 @@ func waitForEndpoint(t *testing.T, url string, timeout time.Duration) {
 	t.Fatalf("endpoint did not come up: %s", url)
 }
 
-func waitForLeader(t *testing.T, client *http.Client, baseURL string, timeout time.Duration) stateResponse {
+func waitForLeader(t *testing.T, client *http.Client, baseURL string, expectedFollowers int, timeout time.Duration) stateResponse {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
@@ -616,11 +800,11 @@ func waitForLeader(t *testing.T, client *http.Client, baseURL string, timeout ti
 		status, body, err := rawRequest(client, http.MethodGet, baseURL+"/raft/state", nil)
 		if err == nil && status == http.StatusOK {
 			var state stateResponse
-			if err := json.Unmarshal(body, &state); err == nil && state.Leader != "" {
+			if err := json.Unmarshal(body, &state); err == nil && state.Leader != "" && len(state.Followers) == expectedFollowers {
 				logHTTPResponse(t, "PASS GET /raft/state", status, body)
 				return state
 			}
-			lastErr = fmt.Errorf("gateway state did not include a leader yet")
+			lastErr = fmt.Errorf("gateway state not stable yet: %s", formatBody(body))
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -639,7 +823,7 @@ func waitForLeader(t *testing.T, client *http.Client, baseURL string, timeout ti
 	return stateResponse{}
 }
 
-func waitForDifferentLeader(t *testing.T, client *http.Client, baseURL string, previousLeader string, timeout time.Duration) stateResponse {
+func waitForDifferentLeader(t *testing.T, client *http.Client, baseURL string, previousLeader string, expectedFollowers int, timeout time.Duration) stateResponse {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
@@ -649,11 +833,11 @@ func waitForDifferentLeader(t *testing.T, client *http.Client, baseURL string, p
 		status, body, err := rawRequest(client, http.MethodGet, baseURL+"/raft/state", nil)
 		if err == nil && status == http.StatusOK {
 			var state stateResponse
-			if err := json.Unmarshal(body, &state); err == nil && state.Leader != "" && state.Leader != previousLeader {
+			if err := json.Unmarshal(body, &state); err == nil && state.Leader != "" && state.Leader != previousLeader && len(state.Followers) == expectedFollowers {
 				logHTTPResponse(t, "PASS GET /raft/state", status, body)
 				return state
 			}
-			lastErr = fmt.Errorf("gateway state did not include a new leader yet")
+			lastErr = fmt.Errorf("gateway failover state not stable yet: %s", formatBody(body))
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}

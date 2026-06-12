@@ -1,0 +1,47 @@
+services:
+  peer:
+    image: golang:1.26
+    working_dir: /workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DEV_LOG_SIZE: ${DEV_LOG_SIZE:-524288}
+      UNAPPLIED_LOG_ENTRIES: ${UNAPPLIED_LOG_ENTRIES:-2000}
+      POSTGRES_DB: ${POSTGRES_DB:-raft}
+      POSTGRES_USER: ${POSTGRES_USER:-raft}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-raft}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      DATABASE_URL: postgres://${POSTGRES_USER:-raft}:${POSTGRES_PASSWORD:-raft}@postgres:5432/${POSTGRES_DB:-raft}?sslmode=disable
+    command:
+      - sh
+      - -c
+      - |
+        go run ./peer \
+          -port=${PEER_PORT:-8000} \
+          -nodeId=${NODE_ID:-node1} \
+          -cluster=${RAFT_CLUSTER:-localhost:${PEER_PORT:-8000}} \
+          -stateDir=/var/lib/raft
+    ports:
+      - "${PEER_PORT:-8000}:${PEER_PORT:-8000}"
+    volumes:
+      - ../..:/workspace
+      - ${RAFT_STATE_DIR:-./state}:/var/lib/raft
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-raft}
+      POSTGRES_USER: ${POSTGRES_USER:-raft}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-raft}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ${DB_DATA_DIR:-./data}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
