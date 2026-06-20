@@ -4,13 +4,20 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/oklog/ulid/v2"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/oklog/ulid/v2"
 )
+
+type Health struct {
+	Health string `json:"health"`
+}
 
 type Gateway struct {
 	mu         sync.RWMutex
@@ -87,6 +94,7 @@ func pollNode(addr string) NodeStatus {
 	resp, err := client.Get(url)
 
 	if err != nil {
+		slog.Error("Node returned an error response.", "Error", err.Error())
 		status.Err = err
 		return status
 	}
@@ -96,26 +104,40 @@ func pollNode(addr string) NodeStatus {
 	err = json.NewDecoder(resp.Body).Decode(&status)
 
 	if err != nil {
+		slog.Error("Node returned an error response.", "Error", err.Error())
 		status.Err = err
 	}
 
 	return status
 }
+func initLogger() {
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelError,
+	})
+
+	logger := slog.New(handler)
+
+	slog.SetDefault(logger)
+}
 
 func main() {
 	port := flag.String("port", "7000", "Gateway port")
-	cluster := flag.String("cluster", "raft-peer-0.raft-peers:8000,raft-peer-1.raft-peers:8000,raft-peer-2.raft-peers:8000", "Comma-separated cluster addresses")
+	cluster := flag.String("cluster", "raft-peer-0.raft-peer:8000,raft-peer-1.raft-peer:8000,raft-peer-2.raft-peer:8000", "Comma-separated cluster addresses")
 	flag.Parse()
 
 	gw := &Gateway{
 		nodes: parseCluster(*cluster),
 	}
 
-	http.HandleFunc("GET /raft/state", func(w http.ResponseWriter, r *http.Request) { stateHandler(gw, w) })
-	http.HandleFunc("GET /raft/get/{key}", func(w http.ResponseWriter, r *http.Request) { getHandler(gw, w, r) })
-	http.HandleFunc("PUT /raft/update/{key}", func(w http.ResponseWriter, r *http.Request) { updateHandler(gw, w, r) })
-	http.HandleFunc("DELETE /raft/delete/{key}", func(w http.ResponseWriter, r *http.Request) { deleteHandler(gw, w, r) })
+	initLogger()
+	//fetch raft statefulset on startup
+	fetchRaftState(gw)
 
+	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { healthHandler(w) })
+	http.HandleFunc("GET /raft/state", func(w http.ResponseWriter, r *http.Request) { stateHandler(gw, w) })
+	http.HandleFunc("GET /raft/kv/{key}", func(w http.ResponseWriter, r *http.Request) { getHandler(gw, w, r) })
+	http.HandleFunc("PUT /raft/kv/{key}", func(w http.ResponseWriter, r *http.Request) { updateHandler(gw, w, r) })
+	http.HandleFunc("DELETE /raft/kv/{key}", func(w http.ResponseWriter, r *http.Request) { deleteHandler(gw, w, r) })
 	addr := ":" + *port
 	fmt.Println("Gateway running on", *port)
 
@@ -133,27 +155,56 @@ func getReqId(r *http.Request) string {
 	return reqId
 }
 
+func fetchRaftState(gw *Gateway) []NodeStatus {
+	statuses := getNodesStatus(gw.nodes)
+
+	leaderAddr := ""
+
+	//assign leader
+	for _, status := range statuses {
+		if status.Role == "leader" {
+			leaderAddr = status.Addr
+			break
+		}
+	}
+
+	gw.mu.Lock()
+	gw.leaderAddr = leaderAddr
+	gw.mu.Unlock()
+
+	return statuses
+}
+
 // GET /raft/state — poll all nodes, return cluster state
 func stateHandler(gw *Gateway, w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 
-	statuses := getNodesStatus(gw.nodes)
+	statuses := fetchRaftState(gw)
 
-	for _, status := range statuses {
-		if status.Role == "leader" {
-			gw.mu.Lock()
-			gw.leaderAddr = status.Addr
-			gw.mu.Unlock()
-		}
-	}
+	gw.mu.RLock()
+	leader := gw.leaderAddr
+	gw.mu.RUnlock()
 
-	json.NewEncoder(w).Encode(StateResponse{
-		Leader:    gw.leaderAddr,
+	if err := json.NewEncoder(w).Encode(StateResponse{
+		Leader:    leader,
 		Followers: getFollowers(statuses),
-	})
+	}); err != nil {
+		http.Error(w, "Internal error occured", http.StatusInternalServerError)
+		return
+	}
 }
 
-// GET /raft/get/{key} — forward to leader's GET /kv/{key}
+// health endpoint
+func healthHandler(w http.ResponseWriter) {
+	w.Header().Set("Content-type", "application/json")
+
+	if err := json.NewEncoder(w).Encode(Health{Health: "OK"}); err != nil {
+		http.Error(w, "Internal error occured", http.StatusInternalServerError)
+		return
+	}
+}
+
+// GET /raft/kv/{key} — forward to leader's GET /kv/{key}
 func getHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
@@ -162,8 +213,15 @@ func getHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 	gw.mu.RUnlock()
 
 	if leader == "" {
-		http.Error(w, "no leader known", http.StatusServiceUnavailable)
-		return
+		fetchRaftState(gw) //refetch it
+		gw.mu.RLock()
+		if gw.leaderAddr == "" { //still not found? return err
+			http.Error(w, "no leader known", http.StatusServiceUnavailable)
+			gw.mu.RUnlock()
+			return
+		}
+		leader = gw.leaderAddr //update leader
+		gw.mu.RUnlock()
 	}
 
 	url := fmt.Sprintf("http://%s/kv/%s", leader, key)
@@ -171,7 +229,7 @@ func getHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 	reqNode(http.MethodGet, url, w, r)
 }
 
-// PUT /raft/update/{key} — forward to leader's PUT /kv/{key}
+// PUT /raft/kv/{key} — forward to leader's PUT /kv/{key}
 func updateHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
@@ -180,8 +238,15 @@ func updateHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 	gw.mu.RUnlock()
 
 	if leader == "" {
-		http.Error(w, "no leader known", http.StatusServiceUnavailable)
-		return
+		fetchRaftState(gw) //refetch it
+		gw.mu.RLock()
+		if gw.leaderAddr == "" { //still not found? return err
+			http.Error(w, "no leader known", http.StatusServiceUnavailable)
+			gw.mu.RUnlock()
+			return
+		}
+		leader = gw.leaderAddr //update leader
+		gw.mu.RUnlock()
 	}
 
 	url := fmt.Sprintf("http://%s/kv/%s", leader, key)
@@ -189,7 +254,7 @@ func updateHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 	reqNode(http.MethodPut, url, w, r)
 }
 
-// DELETE /raft/delete/{key} — forward to leader's DELETE /kv/{key}
+// DELETE /raft/kv/{key} — forward to leader's DELETE /kv/{key}
 func deleteHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
@@ -198,8 +263,15 @@ func deleteHandler(gw *Gateway, w http.ResponseWriter, r *http.Request) {
 	gw.mu.RUnlock()
 
 	if leader == "" {
-		http.Error(w, "no leader known", http.StatusServiceUnavailable)
-		return
+		fetchRaftState(gw) //refetch it
+		gw.mu.RLock()
+		if gw.leaderAddr == "" { //still not found? return err
+			http.Error(w, "no leader known", http.StatusServiceUnavailable)
+			gw.mu.RUnlock()
+			return
+		}
+		leader = gw.leaderAddr //update leader
+		gw.mu.RUnlock()
 	}
 
 	url := fmt.Sprintf("http://%s/kv/%s", leader, key)

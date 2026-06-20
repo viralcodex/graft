@@ -6,89 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync"
 	"time"
 )
 
-type RaftState struct {
-	mu sync.Mutex
-	stateMachineMu sync.Mutex //this locks when we are doing DB ops
-
-	nodeId   string
-	role     string
-	peers    []string
-	stateDir string
-	timer    *time.Timer
-
-	indexState       IndexState
-	leaderIndexState LeaderIndexState
-
-	persistentState PersistentState
-
-	//extra metadata for snapshotting
-	snapshotInFlight map[string]bool
-	snapshotState    SnapshotState
-}
-
-type PersistentState struct {
-	CurrentTerm int        `json:"currentTerm"`
-	VotedFor    string     `json:"votedFor"`
-	Log         []LogEntry `json:"log"`
-}
-
-type LogEntry struct {
-	Command Command
-	Term    int
-	Index   int
-}
-
-// volatile
-type IndexState struct {
-	CommitIndex int
-	LastApplied int
-}
-
-type LeaderIndexState struct {
-	NextIndex  map[string]int
-	MatchIndex map[string]int
-}
-
-// extra metadata to keep in memory raft state
-type SnapshotState struct {
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	LastSnapshotAt    time.Time
-}
-
-type InstallSnapshotRequest struct {
-	Term              int
-	LeaderId          string
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	Offset            int
-	Data              []byte
-	Done              bool
-}
-
-type InstallSnapshotResponse struct {
-	Term int
-}
-
-// temp struct needed
-type snapshotPlan struct {
-	nodeId             string
-	stateDir           string
-	lastIncludedIndex  int
-	lastIncludedTerm   int
-	lastIncludedOffset int
-	baseSnapshotIndex  int
-	baseSnapshotTerm   int
-}
+const HEARTBEAT_INTERVAL = 100 * time.Millisecond
 
 // config
 var logSizeThreshold int64
@@ -150,10 +77,21 @@ func initRaftState(nodeId string, role string, peers []string, stateDir string) 
 		snapshotInFlight: make(map[string]bool),
 		snapshotState:    snapshotMetadata,
 	}
+
+	slog.Info("raft state initialized",
+		"node", nodeId,
+		"role", role,
+		"term", persistantState.CurrentTerm,
+		"peers", len(peers),
+		"last_log_index", getLastLogIndexLocked(),
+		"commit_index", indexState.CommitIndex,
+		"last_applied", indexState.LastApplied,
+		"snapshot_index", snapshotFile.LastIncludedIndex,
+	)
 }
 
 func reconcileSnapshotState(snapshotFile SnapshotFile, persistentState PersistentState) IndexState {
-	ctx, cancel := context.WithTimeout(context.Background(), 3 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	lastApplied, found, err := getRaftMetadata(ctx)
@@ -174,14 +112,25 @@ func reconcileSnapshotState(snapshotFile SnapshotFile, persistentState Persisten
 
 	//bring DB state upto the snapshot when behind
 	if lastApplied < snapshotFile.LastIncludedIndex {
+		slog.Info("reconciling db from snapshot",
+			"node", raftState.nodeId,
+			"db_last_applied", lastApplied,
+			"snapshot_index", snapshotFile.LastIncludedIndex,
+		)
 		if err = updateFromSnapshot(ctx, &snapshotFile); err != nil {
+			slog.Error("failed to reconcile db from snapshot", "error", err.Error())
 			panic(err)
 		}
 		reconciledLastAppliedIndex = snapshotFile.LastIncludedIndex
 	}
 
 	//if lastApplied is out of bounds from absolute log index, panic
-	if lastApplied > snapshotFile.LastIncludedIndex + len(persistentState.Log) {
+	if lastApplied > snapshotFile.LastIncludedIndex+len(persistentState.Log) {
+		slog.Error("invalid lastApplied value",
+			"db_last_applied", lastApplied,
+			"snapshot_index", snapshotFile.LastIncludedIndex,
+			"log_len", len(persistentState.Log),
+		)
 		panic("Invalid lastApplied value")
 	}
 
@@ -191,8 +140,9 @@ func reconcileSnapshotState(snapshotFile SnapshotFile, persistentState Persisten
 	}
 }
 
+// keeping timeout between 500ms-800ms (raft paper has 150ms-300ms)
 func randomTimeout() time.Duration {
-	return time.Duration(150+rand.Intn(150)) * time.Millisecond
+	return time.Duration(500+rand.Intn(300)) * time.Millisecond
 }
 
 func resetElectionTimer() {
@@ -200,11 +150,19 @@ func resetElectionTimer() {
 }
 
 func stepDownLocked(newTerm int) {
+	previousRole := raftState.role
 	raftState.role = "follower"
 	if newTerm > raftState.persistentState.CurrentTerm {
 		raftState.persistentState.CurrentTerm = newTerm
 		raftState.persistentState.VotedFor = ""
 		persistLocked()
+	}
+	if previousRole != "follower" {
+		slog.Info("stepping down",
+			"node", raftState.nodeId,
+			"new_role", raftState.role,
+			"new_term", raftState.persistentState.CurrentTerm,
+		)
 	}
 	resetElectionTimer()
 }
@@ -227,15 +185,22 @@ func applyCommittedCommands(commands []Command, appliedThrough int) {
 
 	startIndex := appliedThrough - len(commands) + 1
 	for offset, command := range commands {
-		applyToStore(command, startIndex + offset)
+		applyToStore(command, startIndex+offset)
 	}
+
+	slog.Info("applied committed commands",
+		"node", raftState.nodeId,
+		"count", len(commands),
+		"start_index", startIndex,
+		"applied_through", appliedThrough,
+	)
 
 	raftState.mu.Lock()
 	if appliedThrough > raftState.indexState.LastApplied {
 		raftState.indexState.LastApplied = appliedThrough
 	}
 	raftState.mu.Unlock()
-} 
+}
 
 /*
 collect the entries from commitIndex -> lastIndex (uncommitted entries) if majority nodes have replicated the entries sent from leader
@@ -354,6 +319,11 @@ func maySnapshot() {
 	finalSnapshotPath := filepath.Join(plan.stateDir, plan.nodeId+".snapshot.json")
 
 	if err := saveSnapshotFileAtPath(tempSnapshotPath, snapshotFile); err != nil {
+		slog.Error("failed to write snapshot temp file",
+			"node", raftState.nodeId,
+			"path", tempSnapshotPath,
+			"error", err.Error(),
+		)
 		return
 	}
 
@@ -378,8 +348,19 @@ func maySnapshot() {
 
 	//update the snapshot file now
 	if err := os.Rename(tempSnapshotPath, finalSnapshotPath); err != nil {
+		slog.Error("failed to publish snapshot",
+			"node", raftState.nodeId,
+			"path", finalSnapshotPath,
+			"error", err.Error(),
+		)
 		panic(err)
 	}
+
+	slog.Info("snapshot published",
+		"node", raftState.nodeId,
+		"last_included_index", snapshotFile.LastIncludedIndex,
+		"last_included_term", snapshotFile.LastIncludedTerm,
+	)
 }
 
 // returns absolute log offset index based on last snapshot index [absolute index - last snapshotted log index]
@@ -519,7 +500,6 @@ if not, we append it to the log and then keep waiting for 2 seconds until the en
 */
 func submitCommand(command Command) bool {
 	//first dedupe check then proceed
-
 	ctx, cancel := dbContext()
 	defer cancel()
 
@@ -530,12 +510,19 @@ func submitCommand(command Command) bool {
 	}
 
 	if found {
+		slog.Info("command already applied",
+			"node", raftState.nodeId,
+			"req_id", command.ReqId,
+			"operation", command.Operation,
+			"key", command.Key,
+		)
 		return true
 	}
 
 	raftState.mu.Lock()
 
 	if raftState.role != "leader" {
+		slog.Info("No longer the leader", "node", raftState.nodeId, "term", raftState.persistentState.CurrentTerm)
 		raftState.mu.Unlock()
 		return false
 	}
@@ -560,6 +547,14 @@ func submitCommand(command Command) bool {
 		persistLocked()
 		existingIndex = entry.Index
 		existingTerm = entry.Term
+		slog.Info("queued command",
+			"node", raftState.nodeId,
+			"req_id", command.ReqId,
+			"operation", command.Operation,
+			"key", command.Key,
+			"index", entry.Index,
+			"term", entry.Term,
+		)
 	}
 
 	raftState.mu.Unlock()
@@ -574,14 +569,31 @@ func submitCommand(command Command) bool {
 		raftState.mu.Unlock()
 
 		if isSaved {
+			slog.Info("command committed",
+				"node", raftState.nodeId,
+				"req_id", command.ReqId,
+				"index", existingIndex,
+			)
 			return true
 		}
 
 		if !isLeader {
+			slog.Info("leadership lost before command commit",
+				"node", raftState.nodeId,
+				"req_id", command.ReqId,
+				"index", existingIndex,
+			)
 			return false
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
+
+	slog.Error("command commit timed out",
+		"node", raftState.nodeId,
+		"req_id", command.ReqId,
+		"index", existingIndex,
+	)
 	return false
 }
 
@@ -633,6 +645,13 @@ func startElection() {
 		lastLogTerm = raftState.persistentState.Log[len(raftState.persistentState.Log)-1].Term
 	}
 
+	slog.Info("starting election",
+		"node", nodeId,
+		"term", term,
+		"last_log_index", lastLogIndex,
+		"last_log_term", lastLogTerm,
+	)
+
 	raftState.mu.Unlock()
 
 	votes := 1
@@ -664,6 +683,11 @@ func startElection() {
 		if resp.Term > term {
 			raftState.mu.Lock()
 			if resp.Term > raftState.persistentState.CurrentTerm { //recheck to prevent any staleness issues
+				slog.Info("election aborted by higher term",
+					"node", raftState.nodeId,
+					"term", term,
+					"higher_term", resp.Term,
+				)
 				stepDownLocked(resp.Term)
 			}
 			raftState.mu.Unlock()
@@ -686,6 +710,11 @@ func startElection() {
 			raftState.mu.Lock()
 			if raftState.role == "candidate" && raftState.persistentState.CurrentTerm == term {
 				raftState.role = "leader"
+				slog.Info("became leader",
+					"node", raftState.nodeId,
+					"term", term,
+					"votes", votes,
+				)
 				raftState.mu.Unlock()
 				go sendAppendEntries()
 				return
@@ -698,6 +727,12 @@ func startElection() {
 		if votes+remainingResponses <= clusterSize/2 {
 			raftState.mu.Lock()
 			if raftState.role == "candidate" && raftState.persistentState.CurrentTerm == term {
+				slog.Info("election lost",
+					"node", raftState.nodeId,
+					"term", term,
+					"votes", votes,
+					"remaining", remainingResponses,
+				)
 				stepDownLocked(term)
 			}
 			raftState.mu.Unlock()
@@ -708,6 +743,10 @@ func startElection() {
 	//still candidate, stepdown
 	raftState.mu.Lock()
 	if raftState.role == "candidate" && raftState.persistentState.CurrentTerm == term {
+		slog.Info("election timed out without majority",
+			"node", raftState.nodeId,
+			"term", term,
+		)
 		stepDownLocked(term)
 	}
 	raftState.mu.Unlock()
@@ -764,6 +803,12 @@ func grantVote(req VoteRequest) VoteResponse {
 
 	persistLocked()
 
+	slog.Info("vote granted",
+		"node", raftState.nodeId,
+		"term", req.Term,
+		"candidate", req.CandidateId,
+	)
+
 	return VoteResponse{
 		Term:        req.Term,
 		VoteGranted: true,
@@ -815,6 +860,11 @@ func sendAppendEntries() {
 						raftState.snapshotInFlight[addr] = false
 						raftState.mu.Unlock()
 					}()
+					slog.Info("sending snapshot to follower",
+						"node", raftState.nodeId,
+						"peer", addr,
+						"snapshot_index", raftState.snapshotState.LastIncludedIndex,
+					)
 					_ = installSnapshot(addr)
 				}(peer)
 				continue
@@ -842,6 +892,12 @@ func sendAppendEntries() {
 			go func(addr string, req AppendEntriesRequest) {
 				resp, err := sendAppendEntry(addr, req)
 				if err != nil {
+					slog.Error("append entries failed",
+						"node", raftState.nodeId,
+						"peer", addr,
+						"term", req.Term,
+						"error", err.Error(),
+					)
 					return
 				}
 
@@ -878,12 +934,17 @@ func sendAppendEntries() {
 
 				//otherwise we backoff one index due to mismatch
 				if raftState.leaderIndexState.NextIndex[addr] > 1 {
+					slog.Info("append entries rejected, backing off next index",
+						"node", raftState.nodeId,
+						"peer", addr,
+						"current_next_index", raftState.leaderIndexState.NextIndex[addr],
+					)
 					raftState.leaderIndexState.NextIndex[addr]--
 				}
 				raftState.mu.Unlock()
 			}(peer, appendReq)
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(HEARTBEAT_INTERVAL) //keeping it 100ms for now
 	}
 }
 
@@ -925,6 +986,11 @@ func receiveAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 	raftState.mu.Lock()
 
 	if req.Term < raftState.persistentState.CurrentTerm {
+		slog.Info("rejecting stale append entries",
+			"node", raftState.nodeId,
+			"request_term", req.Term,
+			"current_term", raftState.persistentState.CurrentTerm,
+		)
 		currentTerm := raftState.persistentState.CurrentTerm
 		raftState.mu.Unlock()
 		return AppendEntriesResponse{
@@ -992,6 +1058,14 @@ func receiveAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 
 	//apply commands to DB
 	applyCommittedCommands(commands, appliedThrough)
+
+	slog.Info("append entries applied",
+		"node", raftState.nodeId,
+		"leader", req.LeaderId,
+		"commit_index", raftState.indexState.CommitIndex,
+		"last_applied", appliedThrough,
+		"entries", len(req.Entries),
+	)
 
 	return AppendEntriesResponse{
 		Term:    currentTerm,
@@ -1095,6 +1169,13 @@ func installSnapshot(peer string) error {
 	snapshotPath := filepath.Join(raftState.stateDir, raftState.nodeId+".snapshot.json")
 	raftState.mu.Unlock()
 
+	slog.Info("starting snapshot install",
+		"node", leaderId,
+		"peer", peer,
+		"last_included_index", lastIncludedIndex,
+		"last_included_term", lastIncludedTerm,
+	)
+
 	bytes, err := os.ReadFile(snapshotPath)
 
 	if err != nil {
@@ -1147,6 +1228,12 @@ func installSnapshot(peer string) error {
 	raftState.leaderIndexState.NextIndex[peer] = lastIncludedIndex + 1
 	raftState.leaderIndexState.MatchIndex[peer] = lastIncludedIndex
 	raftState.mu.Unlock()
+
+	slog.Info("snapshot install completed",
+		"node", leaderId,
+		"peer", peer,
+		"last_included_index", lastIncludedIndex,
+	)
 
 	return nil
 }
@@ -1225,19 +1312,6 @@ func receiveSnapshot(req InstallSnapshotRequest) (InstallSnapshotResponse, error
 		}
 	}()
 
-	// fileInfo, err := file.Stat()
-
-	// if err != nil {
-	// 	return InstallSnapshotResponse{Term: term}
-	// }
-
-	// //offset mismatch
-	// if int(fileInfo.Size()) > req.Offset || int(fileInfo.Size()) < req.Offset {
-	// 	return InstallSnapshotResponse{
-	// 		Term: term,
-	// 	}
-	// }
-
 	written, err := file.WriteAt(req.Data, int64(req.Offset))
 
 	if err != nil || written != len(req.Data) {
@@ -1261,7 +1335,7 @@ func receiveSnapshot(req InstallSnapshotRequest) (InstallSnapshotResponse, error
 	if err := file.Close(); err != nil {
 		return InstallSnapshotResponse{}, err
 	}
-	
+
 	fileClosed = true
 
 	snapshotFile := loadSnapshotFileAtPath(tempSnapshotPath)
@@ -1272,6 +1346,7 @@ func receiveSnapshot(req InstallSnapshotRequest) (InstallSnapshotResponse, error
 	defer cancel()
 
 	raftState.mu.Lock()
+
 	//staleness leader check
 	if req.Term < raftState.persistentState.CurrentTerm {
 		raftState.mu.Unlock()
@@ -1322,6 +1397,13 @@ func receiveSnapshot(req InstallSnapshotRequest) (InstallSnapshotResponse, error
 	if err := os.Rename(tempSnapshotPath, finalSnapshotPath); err != nil {
 		return InstallSnapshotResponse{}, err
 	}
+
+	slog.Info("snapshot received and published",
+		"node", nodeId,
+		"leader", req.LeaderId,
+		"last_included_index", snapshotFile.LastIncludedIndex,
+		"last_included_term", snapshotFile.LastIncludedTerm,
+	)
 
 	return InstallSnapshotResponse{
 		Term: currentTerm,

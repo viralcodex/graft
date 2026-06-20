@@ -11,74 +11,18 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"log/slog"
 )
 
-type PutRequest struct {
-	Value string `json:"value"`
-}
-
-type GetAndPutResponse struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
-type DeleteResponse struct {
-	Key     string `json:"key"`
-	Deleted bool   `json:"deleted"`
-}
-
-type StatusResponse struct {
-	NodeId string `json:"nodeId"`
-	Port   string `json:"port"`
-	Role   string `json:"role"`
-}
-
-type RootResponse struct {
-	Message string `json:"message"`
-}
-
-type VoteRequest struct {
-	Term         int    `json:"term"`
-	CandidateId  string `json:"candidateId"`
-	LastLogIndex int    `json:"lastLogIndex"`
-	LastLogTerm  int    `json:"lastLogTerm"`
-}
-
-type VoteResponse struct {
-	Term        int  `json:"term"`
-	VoteGranted bool `json:"voteGranted"`
-}
-
-type AppendEntriesRequest struct {
-	Term              int        `json:"term"`
-	LeaderId          string     `json:"leaderId"`
-	PrevLogIndex      int        `json:"prevLogIndex"`
-	PrevLogTerm       int        `json:"prevLogTerm"`
-	Entries           []LogEntry `json:"entries"`
-	LeaderCommitIndex int        `json:"leaderCommitIndex"`
-}
-
-type AppendEntriesResponse struct {
-	Term    int  `json:"term"`
-	Success bool `json:"success"`
-}
-
-type Command struct {
-	ReqId     string
-	Operation string
-	Key       string
-	Value     string
-}
-
 func setupConfig() (string, string, string, []string, string) {
-	port := flag.String("port", "8000", "HTTP server port")
+	port := flag.String("port", "8080", "HTTP server port")
 	nodeId := flag.String("nodeId", "node1", "nodeId for the server")
-	cluster := flag.String("cluster", "raft-peer-0.raft-peers:8000,raft-peer-1.raft-peers:8000,raft-peer-2.raft-peers:8000", "Comma-separated cluster addresses")
+	cluster := flag.String("cluster", "raft-peer-0.raft-peer:8000,raft-peer-1.raft-peer:8000,raft-peer-2.raft-peer:8000", "Comma-separated cluster addresses")
 	stateDir := flag.String("stateDir", "state", "Directory for persisted raft state")
 	role := "follower"
 	flag.Parse()
 
-	selfAddr := *nodeId + ".raft-peers:" + *port
+	selfAddr := *nodeId + ".raft-peer:" + *port
 	rawNodes := strings.Split(*cluster, ",")
 	peers := make([]string, 0, len(rawNodes))
 
@@ -93,9 +37,9 @@ func setupConfig() (string, string, string, []string, string) {
 	return *port, *nodeId, role, peers, *stateDir
 }
 
-func startServer(port string, mux *http.ServeMux) (error) {
+func startServer(port string, mux *http.ServeMux) error {
 	server := &http.Server{
-		Addr: ":" + port,
+		Addr:    ":" + port,
 		Handler: mux,
 	}
 
@@ -115,9 +59,9 @@ func startServer(port string, mux *http.ServeMux) (error) {
 			return err
 		}
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		
+
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			_ = server.Close()
 		}
@@ -125,7 +69,7 @@ func startServer(port string, mux *http.ServeMux) (error) {
 	return nil
 }
 
-func initDBConfig() (error) {
+func initDBConfig() error {
 	err := initDB()
 	if err != nil {
 		return err
@@ -133,15 +77,25 @@ func initDBConfig() (error) {
 	return nil
 }
 
+func initLogger() {
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+
+	logger := slog.New(handler)
+
+	slog.SetDefault(logger)
+}
+
 func main() {
 	port, nodeId, role, peers, stateDir := setupConfig()
-	
+
 	if err := initDBConfig(); err != nil {
 		panic(err)
 	}
-	
 	defer dbPool.Close()
-	
+
+	initLogger()
 	initRaftState(nodeId, role, peers, stateDir)
 	go runElectionTimer() //start the timer
 
@@ -154,7 +108,7 @@ func main() {
 	mux.HandleFunc("POST /vote", func(w http.ResponseWriter, r *http.Request) { requestVoteHandler(w, r) })
 	mux.HandleFunc("POST /appendEntries", func(w http.ResponseWriter, r *http.Request) { appendEntriesHandler(w, r) })
 	mux.HandleFunc("POST /snapshot", func(w http.ResponseWriter, r *http.Request) { receiveSnapshotHandler(w, r) })
-	
+
 	if err := startServer(port, mux); err != nil {
 		panic(err)
 	}

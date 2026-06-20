@@ -564,7 +564,7 @@ func peerClusterFlag(cluster []string, selfIndex int) string {
 	entries := make([]string, 0, len(cluster))
 	for idx, addr := range cluster {
 		if idx == selfIndex {
-			entries = append(entries, fmt.Sprintf("node%d.raft-peers:%d", idx+1, portForAddrText(addr)))
+			entries = append(entries, fmt.Sprintf("node%d.raft-peer:%d", idx+1, portForAddrText(addr)))
 			continue
 		}
 		entries = append(entries, addr)
@@ -906,15 +906,15 @@ func putValue(t *testing.T, client *http.Client, baseURL string, key string, val
 		t.Fatalf("marshal put body: %v", err)
 	}
 
-	status, respBody, err := rawRequest(client, http.MethodPut, baseURL+"/raft/update/"+key, body)
+	status, respBody, err := rawRequest(client, http.MethodPut, baseURL+"/raft/kv/"+key, body)
 	if err != nil {
 		t.Fatalf("put value: %v", err)
 	}
 	if status != http.StatusOK {
-		logHTTPResponse(t, "FAIL PUT /raft/update/"+key, status, respBody)
+		logHTTPResponse(t, "FAIL PUT /raft/kv/"+key, status, respBody)
 		t.Fatalf("unexpected PUT status %d: %s", status, string(respBody))
 	}
-	logHTTPResponse(t, "PASS PUT /raft/update/"+key, status, respBody)
+	logHTTPResponse(t, "PASS PUT /raft/kv/"+key, status, respBody)
 
 	var response kvResponse
 	if err := json.Unmarshal(respBody, &response); err != nil {
@@ -927,15 +927,15 @@ func putValue(t *testing.T, client *http.Client, baseURL string, key string, val
 func getValue(t *testing.T, client *http.Client, baseURL string, key string) kvResponse {
 	t.Helper()
 
-	status, respBody, err := rawRequest(client, http.MethodGet, baseURL+"/raft/get/"+key, nil)
+	status, respBody, err := rawRequest(client, http.MethodGet, baseURL+"/raft/kv/"+key, nil)
 	if err != nil {
 		t.Fatalf("get value: %v", err)
 	}
 	if status != http.StatusOK {
-		logHTTPResponse(t, "FAIL GET /raft/get/"+key, status, respBody)
+		logHTTPResponse(t, "FAIL GET /raft/kv/"+key, status, respBody)
 		t.Fatalf("unexpected GET status %d: %s", status, string(respBody))
 	}
-	logHTTPResponse(t, "PASS GET /raft/get/"+key, status, respBody)
+	logHTTPResponse(t, "PASS GET /raft/kv/"+key, status, respBody)
 
 	var response kvResponse
 	if err := json.Unmarshal(respBody, &response); err != nil {
