@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"os"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var dbPool *pgxpool.Pool
@@ -125,7 +126,7 @@ func getValue(ctx context.Context, key string) (string, bool, error) {
 	return value, true, nil
 }
 
-func updateValue(ctx context.Context, key string, value string, reqId string, lastAppliedIndex int) (AppliedResult, error) {
+func updateValue(ctx context.Context, key, value string, reqId string, lastAppliedIndex int) (AppliedResult, error) {
 	tx, err := dbPool.Begin(ctx)
 
 	if err != nil {
@@ -211,11 +212,10 @@ func deleteValue(ctx context.Context, key string, reqId string, lastAppliedIndex
 		return AppliedResult{Found: false}, err
 	}
 
-	
 	if _, err := tx.Exec(ctx, updateRaftMetadataQuery, lastAppliedIndex); err != nil {
 		return AppliedResult{Found: false}, err
 	}
-	
+
 	if err := tx.Commit(ctx); err != nil {
 		return AppliedResult{Found: false}, err
 	}
@@ -337,8 +337,8 @@ func appliedRequestExist(ctx context.Context, reqId *string) (AppliedResult, boo
 	return appliedResult, true, nil
 }
 
-//get current raft metadata
-func getRaftMetadata(ctx context.Context) (int, bool, error){
+// get current raft metadata
+func getRaftMetadata(ctx context.Context) (int, bool, error) {
 	var lastApplied int
 
 	err := dbPool.QueryRow(ctx, getRaftMetadataQuery).Scan(&lastApplied)

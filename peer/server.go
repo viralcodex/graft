@@ -4,26 +4,33 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
-	"log/slog"
 )
 
-func setupConfig() (string, string, string, []string, string) {
-	port := flag.String("port", "8080", "HTTP server port")
-	nodeId := flag.String("nodeId", "node1", "nodeId for the server")
-	cluster := flag.String("cluster", "raft-peer-0.raft-peer:8000,raft-peer-1.raft-peer:8000,raft-peer-2.raft-peer:8000", "Comma-separated cluster addresses")
-	stateDir := flag.String("stateDir", "state", "Directory for persisted raft state")
-	role := "follower"
-	flag.Parse()
+func getEnv(key, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
 
-	selfAddr := *nodeId + ".raft-peer:" + *port
-	rawNodes := strings.Split(*cluster, ",")
+	return value
+}
+
+func setupConfig() (string, string, string, []string, string) {
+	port := getEnv("RAFT_PORT", "8080")
+	nodeId := getEnv("RAFT_NODE_ID", "node1")
+	cluster := getEnv("RAFT_CLUSTER", "raft-peer-0.raft-peer:8080,raft-peer-1.raft-peer:8080,raft-peer-2.raft-peer:8080")
+	stateDir := getEnv("RAFT_STATE_DIR", "state")
+	role := getEnv("RAFT_ROLE", "follower")
+
+	selfAddr := nodeId + ".raft-peer:" + port
+	rawNodes := strings.Split(cluster, ",")
 	peers := make([]string, 0, len(rawNodes))
 
 	for _, addr := range rawNodes {
@@ -34,7 +41,7 @@ func setupConfig() (string, string, string, []string, string) {
 		peers = append(peers, trimmedAddr)
 	}
 
-	return *port, *nodeId, role, peers, *stateDir
+	return port, nodeId, role, peers, stateDir
 }
 
 func startServer(port string, mux *http.ServeMux) error {
@@ -201,7 +208,6 @@ func putValueHandler(w http.ResponseWriter, r *http.Request) {
 
 	err = json.NewEncoder(w).Encode(GetAndPutResponse{
 		Key:   key,
-		Value: req.Value,
 	})
 
 	if err != nil {

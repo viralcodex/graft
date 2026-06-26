@@ -63,11 +63,7 @@ type Command struct {
 	Value     string
 }
 
-/************/
-
 //raft.go
-
-
 type RaftState struct {
 	mu             sync.Mutex
 	stateMachineMu sync.Mutex //this locks when we are doing DB ops

@@ -198,12 +198,7 @@ func TestFollowerCatchesUpFromSnapshotAfterRestart(t *testing.T) {
 		return snapshot.LastIncludedIndex >= 2 && len(persisted.Log) <= 1
 	}, 10*time.Second)
 
-	restartedFollower := startProcess(t, repoRoot, laggingFollowerNodeID, binaries["peer"], clusterRun.peerEnvByNode[laggingFollowerNodeID],
-		"-port", strconv.Itoa(portForAddr(t, laggingFollowerAddr)),
-		"-nodeId", laggingFollowerNodeID,
-		"-cluster", peerClusterFlag(cluster, nodeIndexForID(t, laggingFollowerNodeID)),
-		"-stateDir", filepath.Join(stateDir, laggingFollowerNodeID),
-	)
+	restartedFollower := startProcess(t, repoRoot, laggingFollowerNodeID, binaries["peer"], clusterRun.peerEnvByNode[laggingFollowerNodeID])
 	replaceProcessForAddr(t, clusterRun.processes, cluster, laggingFollowerAddr, restartedFollower)
 	waitForEndpoint(t, fmt.Sprintf("http://%s/health", laggingFollowerAddr), 5*time.Second)
 
@@ -222,7 +217,7 @@ func TestFollowerCatchesUpFromSnapshotAfterRestart(t *testing.T) {
 	logEvent(t, "PASS snapshot-restart", "follower=%s snapshotIndex=%d", laggingFollowerAddr, laggingSnapshot.LastIncludedIndex)
 }
 
-func runGatewayClientFlow(t *testing.T, peerCount int, key string, value string) {
+func runGatewayClientFlow(t *testing.T, peerCount int, key, value string) {
 	t.Helper()
 
 	if testing.Short() {
@@ -281,7 +276,7 @@ func runGatewayClientFlow(t *testing.T, peerCount int, key string, value string)
 	logEvent(t, "PASS stored-data", "%s", mustJSON(t, getResp))
 }
 
-func runGatewayLeaderFailoverFlow(t *testing.T, peerCount int, key string, value string) {
+func runGatewayLeaderFailoverFlow(t *testing.T, peerCount int, key, value string) {
 	t.Helper()
 
 	if testing.Short() {
@@ -454,29 +449,29 @@ func startClusterWithOptions(t *testing.T, repoRoot string, binaries map[string]
 	})
 
 	handle.postgres = startPostgresBackends(t, len(peerPorts))
-	clusterFlag := strings.Join(cluster, ",")
+	gatewayCluster := strings.Join(cluster, ",")
 
 	for idx, port := range peerPorts {
 		nodeID := fmt.Sprintf("node%d", idx+1)
 		nodeStateDir := filepath.Join(stateDir, fmt.Sprintf("node%d", idx+1))
 		peerEnv := mergeEnv(options.peerEnv, map[string]string{
-			"DATABASE_URL": databaseURLForPort(handle.postgres[idx].port),
+			"DATABASE_URL":   databaseURLForPort(handle.postgres[idx].port),
+			"RAFT_PORT":      strconv.Itoa(port),
+			"RAFT_NODE_ID":   nodeID,
+			"RAFT_CLUSTER":   peerClusterFlag(cluster, idx),
+			"RAFT_STATE_DIR": nodeStateDir,
 		})
 		handle.peerEnvByNode[nodeID] = peerEnv
 
-		proc := startProcess(t, repoRoot, fmt.Sprintf("peer-%d", idx+1), binaries["peer"], peerEnv,
-			"-port", strconv.Itoa(port),
-			"-nodeId", nodeID,
-			"-cluster", peerClusterFlag(cluster, idx),
-			"-stateDir", nodeStateDir,
-		)
+		proc := startProcess(t, repoRoot, fmt.Sprintf("peer-%d", idx+1), binaries["peer"], peerEnv)
 		handle.processes = append(handle.processes, proc)
 	}
 
-	handle.processes = append(handle.processes, startProcess(t, repoRoot, "gateway", binaries["gateway"], nil,
-		"-port", strconv.Itoa(gatewayPort),
-		"-cluster", clusterFlag,
-	))
+	gatewayEnv := map[string]string{
+		"GATEWAY_PORT": strconv.Itoa(gatewayPort),
+		"RAFT_CLUSTER": gatewayCluster,
+	}
+	handle.processes = append(handle.processes, startProcess(t, repoRoot, "gateway", binaries["gateway"], gatewayEnv))
 
 	for _, port := range peerPorts {
 		waitForEndpoint(t, fmt.Sprintf("http://localhost:%d/health", port), 5*time.Second)
@@ -877,7 +872,7 @@ func getState(t *testing.T, client *http.Client, baseURL string) stateResponse {
 	return state
 }
 
-func waitForPeerValue(t *testing.T, client *http.Client, addr string, key string, value string, timeout time.Duration) {
+func waitForPeerValue(t *testing.T, client *http.Client, addr string, key, value string, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
@@ -898,7 +893,7 @@ func waitForPeerValue(t *testing.T, client *http.Client, addr string, key string
 	t.Fatalf("peer %q did not apply key %q within %s", addr, key, timeout)
 }
 
-func putValue(t *testing.T, client *http.Client, baseURL string, key string, value string) kvResponse {
+func putValue(t *testing.T, client *http.Client, baseURL string, key, value string) kvResponse {
 	t.Helper()
 
 	body, err := json.Marshal(map[string]string{"value": value})

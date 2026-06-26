@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -110,6 +109,7 @@ func pollNode(addr string) NodeStatus {
 
 	return status
 }
+
 func initLogger() {
 	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelError,
@@ -120,13 +120,21 @@ func initLogger() {
 	slog.SetDefault(logger)
 }
 
+func getEnv(key, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	return value
+}
+
 func main() {
-	port := flag.String("port", "7000", "Gateway port")
-	cluster := flag.String("cluster", "raft-peer-0.raft-peer:8000,raft-peer-1.raft-peer:8000,raft-peer-2.raft-peer:8000", "Comma-separated cluster addresses")
-	flag.Parse()
+	port := getEnv("GATEWAY_PORT", "7000")
+	cluster := getEnv("RAFT_CLUSTER", "raft-peer-0.raft-peer:8080,raft-peer-1.raft-peer:8080,raft-peer-2.raft-peer:8080")
 
 	gw := &Gateway{
-		nodes: parseCluster(*cluster),
+		nodes: parseCluster(cluster),
 	}
 
 	initLogger()
@@ -138,8 +146,8 @@ func main() {
 	http.HandleFunc("GET /raft/kv/{key}", func(w http.ResponseWriter, r *http.Request) { getHandler(gw, w, r) })
 	http.HandleFunc("PUT /raft/kv/{key}", func(w http.ResponseWriter, r *http.Request) { updateHandler(gw, w, r) })
 	http.HandleFunc("DELETE /raft/kv/{key}", func(w http.ResponseWriter, r *http.Request) { deleteHandler(gw, w, r) })
-	addr := ":" + *port
-	fmt.Println("Gateway running on", *port)
+	addr := ":" + port
+	fmt.Println("Gateway running on", port)
 
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		fmt.Println("Error starting gateway:", err)
