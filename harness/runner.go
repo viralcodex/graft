@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -47,9 +46,8 @@ func initRunner(cfg Config) *Runner {
 	}
 }
 
-
 var r *Runner
-var scenarios map[string]Func
+var scenarios []Func
 
 func main() {
 	cfg := Config{
@@ -64,19 +62,19 @@ func main() {
 		},
 	}
 
-	scenarios = map[string]Func{
-		"scenarioOne":   scenarioOne,
-		"scenarioTwo":   scenarioTwo,
-		"scenarioThree": scenarioThree,
-		"scenarioFour":  scenarioFour,
-		"scenarioFive":  scenarioFive,
-		"scenarioSix":   scenarioSix,
+	scenarios = []Func{
+		scenarioOne,
+		scenarioTwo,
+		scenarioThree,
+		scenarioFour,
+		scenarioFive,
+		scenarioSix,
 	}
 
 	err := portForward()
 
 	if err != nil {
-		fail("portForward", err)
+		fail(err)
 	}
 
 	//wait for all port-forwardings
@@ -85,7 +83,7 @@ func main() {
 	r = initRunner(cfg)
 
 	if err := waitForLeader(r.cfg.StartupTimeout); err != nil {
-		fail("waitForLeader", err)
+		fail(err)
 	}
 
 	runScenarios()
@@ -93,65 +91,11 @@ func main() {
 }
 
 func runScenarios() {
-	for key, fun := range scenarios {
+	for _, fun := range scenarios {
 		if err := fun(); err != nil {
-			fail(key, err)
+			fail(err)
 		}
 	}
-}
-
-// gateway request handlers
-func (r *Runner) state(ctx context.Context, reqId string) (StateResponse, error) {
-	var out StateResponse
-
-	err := r.request(ctx, nil, http.MethodGet, r.cfg.Gateway+"/raft/state", &out, reqId)
-
-	return out, err
-}
-
-func (r *Runner) get(ctx context.Context, key string, reqId string) (KVResponse, error) {
-	var out KVResponse
-	err := r.request(ctx, nil, http.MethodGet, r.cfg.Gateway+"/raft/kv/"+key, &out, reqId)
-	return out, err
-}
-
-func (r *Runner) put(ctx context.Context, key, value string, reqId string) (KVResponse, error) {
-	var out KVResponse
-	body, err := json.Marshal(map[string]string{"value": value})
-
-	if err != nil {
-		return out, err
-	}
-
-	err = r.request(ctx, body, http.MethodPut, r.cfg.Gateway+"/raft/kv/"+key, &out, reqId)
-	return out, err
-}
-
-func (r *Runner) delete(ctx context.Context, key, reqId string) (KVResponse, error) {
-	var out KVResponse
-	err := r.request(ctx, nil, http.MethodDelete, r.cfg.Gateway+"/raft/kv/"+key, &out, reqId)
-	return out, err
-}
-
-// peer request handlers
-func (r *Runner) getFromPeer(ctx context.Context, addr, key, reqId string) (KVResponse, error) {
-	var out KVResponse
-	publicAddr, ok := r.cfg.PeerPublicAddresses[addr]
-	if !ok {
-		return out, fmt.Errorf("no public address configured for peer %s", addr)
-	}
-	err := r.request(ctx, nil, http.MethodGet, publicAddr+"/kv/"+key, &out, reqId)
-	return out, err
-}
-
-func (r *Runner) deleteFromPeer(ctx context.Context, addr, key, reqId string) (KVResponse, error) {
-	var out KVResponse
-	publicAddr, ok := r.cfg.PeerPublicAddresses[addr]
-	if !ok {
-		return out, fmt.Errorf("no public address configured for peer %s", addr)
-	}
-	err := r.request(ctx, nil, http.MethodDelete, publicAddr+"/kv/"+key, &out, reqId)
-	return out, err
 }
 
 // poll peer for requests
@@ -195,16 +139,13 @@ func scenarioOne() error {
 		return err
 	}
 
-	fmt.Println("==Scenario One==")
+	fmt.Println("\n\n==Scenario One==")
 
 	key := "1"
 	value := "hello"
 	reqId := getReqId()
 
-	putCtx, putCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-	defer putCancel()
-
-	res, err := r.put(putCtx, key, value, reqId)
+	res, err := putContext(key, value, getReqId())
 
 	if err != nil {
 		return err
@@ -229,25 +170,21 @@ func scenarioOne() error {
 		return fmt.Errorf("[get] Request attr didn't match the response attr: %s:%s :: %s:%s", key, value, res.Key, res.Value)
 	}
 
-	fmt.Printf("response from get: %s:%s\n\n", res.Key, res.Value)
+	fmt.Printf("response from get: %s:%s", res.Key, res.Value)
 
 	return nil
 }
 
-// put and delete kv, then try to get it
 func scenarioTwo() error {
 	if err := waitForLeader(10 * time.Second); err != nil {
 		return err
 	}
-	fmt.Println("==Scenario Two==")
+	fmt.Println("\n\n==Scenario Two==")
 
 	key := "1"
 	value := "hello"
 
-	putCtx, putCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-	defer putCancel()
-
-	res, err := r.put(putCtx, key, value, getReqId())
+	res, err := putContext(key, value, getReqId())
 
 	if err != nil {
 		return err
@@ -259,10 +196,7 @@ func scenarioTwo() error {
 
 	fmt.Printf("response from put: %s:%s\n", res.Key, res.Value)
 
-	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-	defer deleteCancel()
-
-	res, err = r.delete(deleteCtx, key, getReqId())
+	res, err = deleteContext(key, getReqId())
 
 	if err != nil {
 		return err
@@ -283,7 +217,7 @@ func scenarioTwo() error {
 		return fmt.Errorf("Deleted key shouldn't be present")
 	}
 
-	fmt.Printf("Deleted entry: %s:%s doesn't exist.\nError: %s\n\n", key, value, err.Error())
+	fmt.Printf("Deleted entry: %s:%s doesn't exist.\nError: %s", key, value, err.Error())
 	return nil
 }
 
@@ -292,15 +226,12 @@ func scenarioThree() error {
 		return err
 	}
 
-	fmt.Println("==Scenario Three==")
+	fmt.Println("\n\n==Scenario Three==")
 
 	key := "1"
 	value := "hello"
 
-	putCtx, putCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-	defer putCancel()
-
-	res, err := r.put(putCtx, key, value, getReqId())
+	res, err := putContext(key, value, getReqId())
 
 	if err != nil {
 		return err
@@ -343,7 +274,7 @@ func scenarioThree() error {
 		}
 	}
 
-	fmt.Printf("All followers deleted the entry %s:%s\n\n", key, value)
+	fmt.Printf("All followers deleted the entry %s:%s", key, value)
 
 	return nil
 }
@@ -353,7 +284,7 @@ func scenarioFour() error {
 		return err
 	}
 
-	fmt.Println("===Scenario Four===")
+	fmt.Println("\n\n==Scenario Four===")
 
 	addr := r.cfg.Leader
 	podName, _, _ := strings.Cut(addr, ".")
@@ -381,10 +312,7 @@ func scenarioFour() error {
 		return err
 	}
 
-	putCtx, putCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-	defer putCancel()
-
-	res, err := r.put(putCtx, key, value, getReqId())
+	res, err := putContext(key, value, getReqId())
 
 	if err != nil {
 		return err
@@ -400,7 +328,7 @@ func scenarioFour() error {
 		return err
 	}
 
-	fmt.Printf("old leader replicated entry from new leader:%s\n\n", addr)
+	fmt.Printf("old leader replicated entry from new leader:%s", addr)
 
 	return nil
 }
@@ -410,7 +338,7 @@ func scenarioFive() error {
 		return err
 	}
 
-	fmt.Println("===Scenario Five===")
+	fmt.Println("\n\n==Scenario Five===")
 
 	set := map[string]string{
 		"1": "value1",
@@ -426,9 +354,7 @@ func scenarioFive() error {
 	}
 
 	for key, value := range set {
-		putCtx, putCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-		res, err := r.put(putCtx, key, value, getReqId())
-		putCancel()
+		res, err := putContext(key, value, getReqId())
 
 		if err != nil {
 			return err
@@ -454,7 +380,7 @@ func scenarioFive() error {
 		}
 	}
 
-	fmt.Printf("Follower caught up with leader after restarting:%s\n%v\n\n", podName, set)
+	fmt.Printf("Follower caught up with leader after restarting:%s\n%v", podName, set)
 
 	return nil
 }
@@ -464,7 +390,7 @@ func scenarioSix() error {
 		return err
 	}
 
-	fmt.Println("===Scenario Six===")
+	fmt.Println("\n\n==Scenario Six===")
 
 	//multiple req with same request-id but diff values, should only keep the 1st one
 	key := "key1"
@@ -473,9 +399,7 @@ func scenarioSix() error {
 	for i := range 3 {
 		value := "v" + strconv.Itoa(i)
 
-		putCtx, putCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-		_, err := r.put(putCtx, key, value, reqId)
-		putCancel()
+		_, err := putContext(key, value, reqId)
 
 		if err != nil {
 			return err

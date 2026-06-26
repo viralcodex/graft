@@ -1,12 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -17,12 +13,22 @@ import (
 
 var portForwards []*exec.Cmd
 
-func fail(scenario string, err error) {
-	fmt.Fprintf(os.Stderr, "%s: %v\n", scenario, err)
-}
-
 func getReqId() string {
 	return ulid.Make().String()
+}
+
+func getPortPairs(addr string) string {
+	publicAddr := strings.Split(r.cfg.PeerPublicAddresses[addr], ":")
+	publicPort := publicAddr[len(publicAddr)-1]
+
+	address := strings.Split(addr, ":")
+	port := address[len(address)-1]
+
+	return publicPort + ":" + port
+}
+
+func fail(err error) {
+	fmt.Fprintf(os.Stderr, "%v\n", err)
 }
 
 func execCommand(command string, args []string) error {
@@ -129,61 +135,8 @@ func killPod(podName string) error {
 	return nil
 }
 
-func (r *Runner) request(ctx context.Context, body []byte, method, url string, resObj any, reqId string) error {
-	var reader io.Reader
-
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, url, reader)
-
-	if err != nil {
-		return err
-	}
-
-	if body != nil {
-		req.Header.Set("content-type", "application/json")
-		req.Header.Set("X-Request-Id", reqId)
-	}
-
-	res, err := r.client.Do(req)
-
-	if err != nil {
-		return err
-	}
-
-	defer res.Body.Close()
-
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		data, err := io.ReadAll(res.Body)
-
-		if err != nil {
-			return err
-		}
-
-		return fmt.Errorf("%s %s failed: status=%d body=%s", method, url, res.StatusCode, string(data))
-	}
-
-	if resObj == nil {
-		return nil
-	}
-
-	return json.NewDecoder(res.Body).Decode(resObj)
-}
-
-func getPortPairs(addr string) string {
-	publicAddr := strings.Split(r.cfg.PeerPublicAddresses[addr], ":")
-	publicPort := publicAddr[len(publicAddr)-1]
-
-	address := strings.Split(addr, ":")
-	port := address[len(address)-1]
-
-	return publicPort + ":" + port
-}
-
 func cleanupPortForwards() {
-	fmt.Println("\n\n===Closing open port forwards===")
+	fmt.Println("\n\n==Closing open port forwards==")
 	for _, cmd := range portForwards {
 		if cmd == nil || cmd.Process == nil {
 			continue
@@ -195,4 +148,44 @@ func cleanupPortForwards() {
 			fmt.Printf("Couldn't stop process %d: %v\n", cmd.Process.Pid, err)
 		}
 	}
+}
+
+//context wrappers for requests
+func getContext(key, reqId string) (KVResponse, error) {
+	getCtx, getCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
+	defer getCancel()
+
+	if reqId == "" {
+		reqId = getReqId()
+	}
+
+	res, err := r.get(getCtx, key, getReqId())
+
+	return res, err
+}
+
+func putContext(key, value, reqId string) (KVResponse, error) {
+	putCtx, putCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
+	defer putCancel()
+	
+	if reqId == "" {
+		reqId = getReqId()
+	}
+	
+	res, err := r.put(putCtx, key, value, reqId)
+
+	return res, err
+}
+
+func deleteContext(key, reqId string) (KVResponse, error) {
+	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
+	defer deleteCancel()
+
+	if reqId == "" {
+		reqId = getReqId()
+	}
+
+	res, err := r.delete(deleteCtx, key, getReqId())
+
+	return res, err
 }
