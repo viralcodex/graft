@@ -31,16 +31,17 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
-          args:
-            - -port=8080
-            - -nodeId=$(POD_NAME)
-            - -cluster=raft-peer-0.raft-peer:8080,raft-peer-1.raft-peer:8080,raft-peer-2.raft-peer:8080
-            - -stateDir=/data/raft
           env:
-            - name: POD_NAME
+            - name: RAFT_PORT
+              value: "8080"
+            - name: RAFT_NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: RAFT_CLUSTER
+              value: raft-peer-0.raft-peer:8080,raft-peer-1.raft-peer:8080,raft-peer-2.raft-peer:8080
+            - name: RAFT_STATE_DIR
+              value: /data/raft
             - name: DATABASE_URL
               value: postgres://raft:raft@127.0.0.1:5432/raft?sslmode=disable
           volumeMounts:
@@ -155,9 +156,11 @@ spec:
         - name: gateway
           image: gateway:latest
           imagePullPolicy: Always
-          args:
-            - -port=7000
-            - -cluster=raft-peer-0.raft-peer:8080,raft-peer-1.raft-peer:8080,raft-peer-2.raft-peer:8080
+          env:
+            - name: GATEWAY_PORT
+              value: "7000"
+            - name: RAFT_CLUSTER
+              value: raft-peer-0.raft-peer:8080,raft-peer-1.raft-peer:8080,raft-peer-2.raft-peer:8080
           ports:
             - containerPort: 7000
           resources:
