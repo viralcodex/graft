@@ -6,68 +6,54 @@ This project is my first time building with Go so the code could be sloppy & beg
 
 ## Architecture (WIP)
 
-The clients will call a simple Gateway service (stable endpoint pointing to the gateway pod running inside K8s) that will in turn call the leader pod inside the k8s StatefulSet. Internally, there will be N nodes that will be in consensus using the Raft Algorithm & each having their own DB as a place to store the data (will keep it simple like a KV store).
+The clients will call a simple Gateway service (stable endpoint pointing to the gateway pod running inside K8s) that will in turn call the leader pod inside the k8s StatefulSet. Internally, there will be N (3) nodes that will be in consensus using the Raft Algorithm & each having their own DB as a place to store the data (will keep it simple like a KV store).
 Each Pod will have their own Log file that will store the operations requested by the client(s).
 
 So client calls the gateway service, which in turn calls the gateway pod and which calls the leader pod in the K8s StatefulSet.
 
 <i>
-[Current state - basic Raft implemented with gateway & nodes locally (with snapshotting)
+[Current state - Raft implemented with gateway & nodes, PostgreSQL DB on each peer for persistent KV storage & idempotency tracking, deployed on Kubernetes. Currently writing the test harness.
 <br/>
-Next step - Adding DB to the nodes to persist the data & removing in-memory KVStore.]
+Next step - End-to-end testing with the harness.]
 </i>
 
 ```mermaid
-flowchart LR
+flowchart TD
     C[Client] --> SVC[Gateway Service]
     SVC --> GW[Gateway Pod<br/>Leader-aware router]
 
     subgraph K8S[Kubernetes Cluster]
-        GW
-
         subgraph RAFT[Raft Peer StatefulSet]
             direction LR
 
             subgraph P0[peer-0]
-                R0[Raft Node]
-                DB0[(Embedded DB)]
-                PV0[(Persistent Volume)]
-                R0 --> DB0
-                DB0 --> PV0
+                R0[Raft Node] --> DB0[(PostgreSQL)]
             end
 
             subgraph P1[peer-1]
-                R1[Raft Node]
-                DB1[(Embedded DB)]
-                PV1[(Persistent Volume)]
-                R1 --> DB1
-                DB1 --> PV1
+                R1[Raft Node] --> DB1[(PostgreSQL)]
             end
 
             subgraph P2[peer-2]
-                R2[Raft Node]
-                DB2[(Embedded DB)]
-                PV2[(Persistent Volume)]
-                R2 --> DB2
-                DB2 --> PV2
+                R2[Raft Node] --> DB2[(PostgreSQL)]
             end
         end
 
+        GW
         HS[Headless Service<br/>Stable peer DNS]
+        HS --> R0
+        HS --> R1
+        HS --> R2
     end
 
-    GW -->|Forward client request to current leader| R0
-    GW -. Health checks / leader discovery .-> R0
-    GW -. Health checks / leader discovery .-> R1
-    GW -. Health checks / leader discovery .-> R2
+    GW -->|to leader| R0
+    GW -.->|health checks| R0
+    GW -.->|health checks| R1
+    GW -.->|health checks| R2
 
-    R0 <--> |AppendEntries / RequestVote| R1
-    R1 <--> |AppendEntries / RequestVote| R2
-    R2 <--> |AppendEntries / RequestVote| R0
-
-    HS --- R0
-    HS --- R1
-    HS --- R2
+    R0 <-->|AppendEntries / RequestVote| R1
+    R1 <-->|AppendEntries / RequestVote| R2
+    R2 <-->|AppendEntries / RequestVote| R0
 ```
 
 ## Learning
