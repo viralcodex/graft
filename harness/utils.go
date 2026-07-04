@@ -13,6 +13,15 @@ import (
 
 var portForwards []*exec.Cmd
 
+func fail(err error) {
+	fmt.Fprintf(os.Stderr, "%v\n", err)
+	panic(err)
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("%s %s failed: status=%d body=%s", e.Method, e.URL, e.StatusCode, e.Body)
+}
+
 func getReqId() string {
 	return ulid.Make().String()
 }
@@ -25,10 +34,6 @@ func getPortPairs(addr string) string {
 	port := address[len(address)-1]
 
 	return publicPort + ":" + port
-}
-
-func fail(err error) {
-	fmt.Fprintf(os.Stderr, "%v\n", err)
 }
 
 func execCommand(command string, args []string) error {
@@ -159,7 +164,7 @@ func getContext(key, reqId string) (KVResponse, error) {
 		reqId = getReqId()
 	}
 
-	res, err := r.get(getCtx, key, getReqId())
+	res, err := r.get(getCtx, key, reqId)
 
 	return res, err
 }
@@ -185,7 +190,7 @@ func deleteContext(key, reqId string) (KVResponse, error) {
 		reqId = getReqId()
 	}
 
-	res, err := r.delete(deleteCtx, key, getReqId())
+	res, err := r.delete(deleteCtx, key, reqId)
 
 	return res, err
 }

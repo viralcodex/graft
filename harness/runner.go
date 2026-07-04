@@ -2,38 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
-
-type Config struct {
-	RequestTimeout      time.Duration
-	StartupTimeout      time.Duration
-	PollingInterval     time.Duration
-	Gateway             string
-	Followers           []string
-	Leader              string
-	PeerPublicAddresses map[string]string
-}
-
-type Runner struct {
-	cfg    Config
-	client *http.Client
-}
-
-type StateResponse struct {
-	Leader    string   `json:"leader"`
-	Followers []string `json:"followers"`
-}
-
-type KVResponse struct {
-	Key     string `json:"key"`
-	Value   string `json:"value"`
-	Deleted bool   `json:"deleted"`
-}
 
 type Func func() error
 
@@ -76,6 +51,7 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
+	defer cleanupPortForwards() //cleanup after shutdown
 
 	//wait for all port-forwardings
 	time.Sleep(10 * time.Second)
@@ -87,7 +63,6 @@ func main() {
 	}
 
 	runScenarios()
-	cleanupPortForwards()
 }
 
 func runScenarios() {
@@ -122,11 +97,17 @@ func pollIsDeletedFromPeer(addr, key, reqId string) error {
 
 	for time.Now().Before(timeout) {
 		ctx, cancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-		_, err := r.deleteFromPeer(ctx, addr, key, reqId)
+		res, err := r.getFromPeer(ctx, addr, key, reqId)
 		cancel()
 
-		if err != nil {
+		var httpErr *HTTPError
+		
+		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
 			return nil
+		}
+
+		if res.Key != key {
+			return fmt.Errorf("Key isn't deleted from the peer: %s", addr)
 		}
 
 		time.Sleep(r.cfg.PollingInterval)
@@ -369,7 +350,7 @@ func scenarioFive() error {
 		return err
 	}
 
-	//restart port-forwarding for the killed leader
+	//restart port-forwarding for the killed follower
 	if err := execBgCommand("kubectl", append([]string{}, "port-forward", "pod/"+podName, getPortPairs(addr))); err != nil {
 		return err
 	}
@@ -413,6 +394,10 @@ func scenarioSix() error {
 
 	if err != nil {
 		return err
+	}
+
+	if res.Value != "v0" || res.Key != key {
+		fail(fmt.Errorf("[get-idempotency] idempontency isn't working in raft. Expected: %s:%s :: Received: %s:%s", key, "v0", res.Key, res.Value))
 	}
 
 	fmt.Printf("[get-idempotency] entry matches first put request: %s:%s", res.Key, res.Value)

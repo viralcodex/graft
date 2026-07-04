@@ -96,7 +96,12 @@ func (r *Runner) request(ctx context.Context, body []byte, method, url string, r
 			return err
 		}
 
-		return fmt.Errorf("%s %s failed: status=%d body=%s", method, url, res.StatusCode, string(data))
+		return &HTTPError{
+			Method:     method,
+			URL:        url,
+			StatusCode: res.StatusCode,
+			Body:       string(data),
+		}
 	}
 
 	if resObj == nil {
