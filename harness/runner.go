@@ -39,13 +39,13 @@ func main() {
 	}
 
 	scenarios = []Func{
-		// scenarioOne,
-		// scenarioTwo,
-		// scenarioThree,
-		// scenarioFour,
-		// scenarioFive,
-		// scenarioSix,
-		// scenarioSeven,
+		scenarioOne,
+		scenarioTwo,
+		scenarioThree,
+		scenarioFour,
+		scenarioFive,
+		scenarioSix,
+		scenarioSeven,
 		scenarioEight,
 	}
 
