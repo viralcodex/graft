@@ -76,10 +76,8 @@ func (r *Runner) request(ctx context.Context, body []byte, method, url string, r
 		return err
 	}
 
-	if body != nil {
-		req.Header.Set("content-type", "application/json")
-		req.Header.Set("X-Request-Id", reqId)
-	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("X-Request-Id", reqId)
 
 	res, err := r.client.Do(req)
 

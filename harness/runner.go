@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,12 +39,14 @@ func main() {
 	}
 
 	scenarios = []Func{
-		scenarioOne,
-		scenarioTwo,
-		scenarioThree,
-		scenarioFour,
-		scenarioFive,
-		scenarioSix,
+		// scenarioOne,
+		// scenarioTwo,
+		// scenarioThree,
+		// scenarioFour,
+		// scenarioFive,
+		// scenarioSix,
+		// scenarioSeven,
+		scenarioEight,
 	}
 
 	err := portForward()
@@ -100,9 +103,9 @@ func pollIsDeletedFromPeer(addr, key, reqId string) error {
 		res, err := r.getFromPeer(ctx, addr, key, reqId)
 		cancel()
 
-		var httpErr *HTTPError
-		
-		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+		var httpError *HTTPError
+
+		if errors.As(err, &httpError) && httpError.StatusCode == http.StatusNotFound {
 			return nil
 		}
 
@@ -270,6 +273,12 @@ func scenarioFour() error {
 	addr := r.cfg.Leader
 	podName, _, _ := strings.Cut(addr, ".")
 
+	//free the port
+	if err := stopPortForward(addr); err != nil {
+		return err
+	}
+
+	//then kill the pod
 	if err := killPod(podName); err != nil {
 		return err
 	}
@@ -329,7 +338,12 @@ func scenarioFive() error {
 	addr := r.cfg.Followers[0]
 	podName, _, _ := strings.Cut(addr, ".")
 
-	//kill a follower pod
+	//free the port first
+	if err := stopPortForward(addr); err != nil {
+		return err
+	}
+
+	//then kill a follower pod
 	if err := killPod(podName); err != nil {
 		return err
 	}
@@ -380,10 +394,14 @@ func scenarioSix() error {
 	for i := range 3 {
 		value := "v" + strconv.Itoa(i)
 
-		_, err := putContext(key, value, reqId)
+		res, err := putContext(key, value, reqId)
 
 		if err != nil {
 			return err
+		}
+
+		if res.Key != key || res.Value != value {
+			return fmt.Errorf("[put-idempotency] put failed: Expected: %s:%s :: Received: %s:%s\n", key, value, res.Key, res.Value)
 		}
 	}
 
@@ -397,10 +415,203 @@ func scenarioSix() error {
 	}
 
 	if res.Value != "v0" || res.Key != key {
-		fail(fmt.Errorf("[get-idempotency] idempontency isn't working in raft. Expected: %s:%s :: Received: %s:%s", key, "v0", res.Key, res.Value))
+		fail(fmt.Errorf("[put-idempotency] idempontency isn't working in raft. Expected: %s:%s :: Received: %s:%s\n", key, "v0", res.Key, res.Value))
 	}
 
-	fmt.Printf("[get-idempotency] entry matches first put request: %s:%s", res.Key, res.Value)
+	fmt.Printf("[put-idempotency] entry matches first put request: %s:%s\n", res.Key, res.Value)
+
+	//now we do it for delete as well
+
+	reqId = getReqId() //new ID for delete
+
+	for range 3 {
+		res, err := deleteContext(key, reqId)
+
+		if err != nil {
+			return err
+		}
+
+		if !res.Deleted {
+			return fmt.Errorf("[delete-idempotency] delete failed: %s:%v\n", res.Key, res.Deleted)
+		}
+	}
+
+	getCtx, getCancel = context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
+	defer getCancel()
+
+	res, err = r.get(getCtx, key, getReqId())
+
+	var httpError *HTTPError
+
+	if err != nil && (!errors.As(err, &httpError) || httpError.StatusCode != http.StatusNotFound) {
+		return err
+	}
+
+	if res.Key != "" {
+		fail(fmt.Errorf("[delete-idempotency] idempontency isn't working in raft. expected key:%s :: Received key:%s\n", key, res.Key))
+	}
+
+	return nil
+}
+
+func scenarioSeven() error {
+	if err := waitForLeader(10 * time.Second); err != nil {
+		return err
+	}
+
+	fmt.Println("\n\n==Scenario Seven===")
+
+	var wg sync.WaitGroup
+
+	n := 20
+
+	errs := make(chan error, n)
+
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			key := fmt.Sprintf("conkey-%d", i)
+			value := fmt.Sprintf("convalue-%d", i)
+
+			res, err := putContext(key, value, getReqId())
+
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			if res.Key != key || res.Value != value {
+				errs <- fmt.Errorf("[put-concurrent] Request attr didn't match the response attr: %s:%s :: %s:%s\n", key, value, res.Key, res.Value)
+				return
+			}
+
+			fmt.Printf("[put-concurrent] Write for %s:%s for %d iteration runs fine\n", key, value, i)
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Println()
+
+	//now we check each value is in the store or not
+	errs = make(chan error, n)
+
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			key := fmt.Sprintf("conkey-%d", i)
+			value := fmt.Sprintf("convalue-%d", i)
+
+			res, err := getContext(key, getReqId())
+
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			if res.Key != key || res.Value != value {
+				errs <- fmt.Errorf("[get-concurrent] Request attr didn't match the response attr: %s:%s :: %s:%s\n", key, value, res.Key, res.Value)
+				return
+			}
+
+			fmt.Printf("[get-concurrent] Read for %s:%s for %d iteration runs fine\n", key, value, i)
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("Concurrent writes and then reads work fine for %d runs\n", n)
+
+	return nil
+}
+
+func scenarioEight() error {
+	if err := waitForLeader(10 * time.Second); err != nil {
+		return err
+	}
+
+	fmt.Println("\n\n==Scenario Eight===")
+
+	var wg sync.WaitGroup
+
+	n := 20
+	key := "conkey"
+
+	errs := make(chan error, n)
+
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			value := fmt.Sprintf("%d", i)
+
+			res, err := putContext(key, value, getReqId())
+
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			if res.Key != key || res.Value != value {
+				errs <- fmt.Errorf("[put-concurrent] Request attr didn't match the response attr: %s:%s :: %s:%s\n", key, value, res.Key, res.Value)
+				return
+			}
+			fmt.Printf("[put-concurrent] Read for %s:%s for %d iteration runs fine\n", key, value, i)
+
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+
+	res, err := getContext(key, getReqId())
+
+	if err != nil {
+		return err
+	}
+
+	val, err := strconv.Atoi(res.Value)
+
+	if err != nil {
+		return err
+	}
+
+	if res.Key != key || val > n || val < 0 {
+		return fmt.Errorf("[get-value-concurrent] Response isn't matching expected entry: %s:%s\n", res.Key, res.Value)
+	}
+
+	//now we check if followers have replicated the same values
+	for _, follower := range r.cfg.Followers {
+		if err := pollGetFromPeer(follower, key, res.Value, getReqId()); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("All followers replicated the entry %s:%s\n\n", key, res.Value)
 
 	return nil
 }

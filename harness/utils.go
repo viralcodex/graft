@@ -51,7 +51,7 @@ func execCommand(command string, args []string) error {
 
 func execBgCommand(command string, args []string) error {
 	cmd := exec.Command(command, args...)
-	cmd.Stdout = os.Stdout
+	// cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
@@ -71,6 +71,8 @@ func execBgCommand(command string, args []string) error {
 }
 
 func portForward() error {
+	fmt.Println("Starting port forwards...")
+
 	k8s := "kubectl"
 
 	//gateway
@@ -140,8 +142,13 @@ func killPod(podName string) error {
 	return nil
 }
 
-func cleanupPortForwards() {
-	fmt.Println("\n\n==Closing open port forwards==")
+func stopPortForward(addr string) error {
+	portPair := getPortPairs(addr)
+	
+	if portPair == "" && addr == "http://localhost:7000" {
+		portPair = addr
+	}
+
 	for _, cmd := range portForwards {
 		if cmd == nil || cmd.Process == nil {
 			continue
@@ -149,13 +156,45 @@ func cleanupPortForwards() {
 		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 			continue
 		}
+		if len(cmd.Args) == 0 || cmd.Args[len(cmd.Args)-1] != portPair {
+			continue
+		}
+
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			return err
+		}
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+				return nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		return fmt.Errorf("port-forward for %s did not exit in time", addr)
+	}
+
+	return nil
+}
+
+func cleanupPortForwards() {
+	fmt.Println("==Closing open port forwards==")
+	for _, cmd := range portForwards {
+		if cmd == nil || cmd.Process == nil {
+			continue
+		}
+		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+			continue
+		}
+		//stop the process
 		if err := cmd.Process.Signal(os.Interrupt); err != nil {
 			fmt.Printf("Couldn't stop process %d: %v\n", cmd.Process.Pid, err)
 		}
 	}
 }
 
-//context wrappers for requests
+// context wrappers for requests
 func getContext(key, reqId string) (KVResponse, error) {
 	getCtx, getCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
 	defer getCancel()
@@ -172,11 +211,11 @@ func getContext(key, reqId string) (KVResponse, error) {
 func putContext(key, value, reqId string) (KVResponse, error) {
 	putCtx, putCancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
 	defer putCancel()
-	
+
 	if reqId == "" {
 		reqId = getReqId()
 	}
-	
+
 	res, err := r.put(putCtx, key, value, reqId)
 
 	return res, err
